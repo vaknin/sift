@@ -19,8 +19,18 @@
 		panes,
 		eyes,
 		boost,
-		zoom = $bindable()
-	}: { panes: Shot[]; eyes: boolean; boost: boolean; zoom: Zoom } = $props();
+		zoom = $bindable(),
+		active = 0,
+		onactivate
+	}: {
+		panes: Shot[];
+		eyes: boolean;
+		boost: boolean;
+		zoom: Zoom;
+		/** With two panes: the one keys act on. */
+		active?: number;
+		onactivate?: (i: number) => void;
+	} = $props();
 
 	// Pane and natural image sizes; at most two panes.
 	const blank = () => ({ cw: 0, ch: 0, nw: 0, nh: 0 });
@@ -70,6 +80,7 @@
 	}
 	let drag: { i: number; x: number; y: number } | null = null;
 	function onpointerdown(i: number, e: PointerEvent) {
+		onactivate?.(i);
 		drag = { i, x: e.clientX, y: e.clientY };
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 	}
@@ -84,10 +95,11 @@
 </script>
 
 <div class="panes">
-	{#each panes as shot, i (shot.file + i)}
+	{#each panes as shot, i (i)}
 		{@const u = url(shot)}
 		<div
 			class="pane"
+			class:active={panes.length > 1 && i === active}
 			role="img"
 			aria-label={shot.file}
 			bind:clientWidth={() => sizes[i]?.cw ?? 0, (v) => sizes[i] && (sizes[i].cw = v)}
@@ -135,6 +147,13 @@
 		background: #000;
 		cursor: grab;
 		touch-action: none;
+	}
+	.pane.active::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		border: 2px solid var(--accent);
+		pointer-events: none;
 	}
 	img {
 		position: absolute;

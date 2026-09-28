@@ -5,7 +5,6 @@
 	let { shot }: { shot: Shot } = $props();
 	const mark = $derived(effective(shot));
 	const confirmed = $derived(shot.decision !== null);
-	const stars = $derived(shot.decision?.stars ?? 0);
 </script>
 
 <span
@@ -15,7 +14,6 @@
 >
 	{mark === 'pick' ? '★' : mark === 'reject' ? '✗' : '?'}
 </span>
-{#if stars > 0}<span class="stars">{'★'.repeat(stars)}</span>{/if}
 
 <style>
 	.badge {
@@ -51,11 +49,5 @@
 	.confirmed.none {
 		background: var(--muted);
 		border-color: var(--muted);
-	}
-	.stars {
-		margin-left: 0.3rem;
-		color: var(--star);
-		font-size: 0.8rem;
-		text-shadow: 0 0 3px #000;
 	}
 </style>

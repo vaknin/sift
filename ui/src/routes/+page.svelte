@@ -1,13 +1,14 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
+	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { homeDir, join } from '@tauri-apps/api/path';
-	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import * as api from '$lib/api';
 	import { effective, judgeable, matches, src } from '$lib/api';
 	import type { Decision, Filter, Progress, Shot, View } from '$lib/types';
 	import Tile from '$lib/Tile.svelte';
 	import EyeStrip from '$lib/EyeStrip.svelte';
+	import Filmstrip from '$lib/Filmstrip.svelte';
 	import Badge from '$lib/Badge.svelte';
 	import ZoomView, { fitZoom, type Zoom } from '$lib/ZoomView.svelte';
 
@@ -21,6 +22,15 @@
 	let eyesMode = $state(false);
 	let boost = $state(true);
 	let zoom = $state<Zoom>(fitZoom());
+	/** Image only: no bars or strips, the window fullscreen. Keys keep working. */
+	let fullscreen = $state(false);
+	/** Frames marked for compare, in marking order: [A, B]. */
+	let sel = $state<number[]>([]);
+	/** The two frames in compare, and which side keys act on (`cur` is that side). */
+	let pair = $state<[number, number]>([0, 0]);
+	let active = $state(0);
+	/** Mode to return to when compare closes. */
+	let back: 'grid' | 'full' = 'grid';
 	let sending = $state(false);
 	/** Outcome of the last Send. */
 	let sendNote = $state<{ written: number; queued: number; failed: [string, string][]; unsent: number } | null>(null);
@@ -60,18 +70,31 @@
 		return picks[0] ?? others.sort(by)[0];
 	});
 
-	// Keep the current frame visible under the active filter.
+	// Keep the current frame visible under the active filter (compare keeps
+	// its two frames even when a decision filters them out).
 	$effect(() => {
-		if (flat.length && !flat.includes(cur)) cur = flat.find((i) => i > cur) ?? flat.at(-1)!;
+		if (mode !== 'compare' && flat.length && !flat.includes(cur)) cur = flat.find((i) => i > cur) ?? flat.at(-1)!;
 	});
-	// Scroll the current tile, eye crop and group into view; reset the zoom.
+	// Scroll the current tile, frame, eye crop and group into view.
 	$effect(() => {
 		const c = cur;
 		const g = curGroup;
-		zoom = fitZoom();
 		tick().then(() => {
-			for (const id of [`tile-${c}`, `eyes-${c}`, `group-${g}`])
+			for (const id of [`tile-${c}`, `film-${c}`, `eyes-${c}`, `group-${g}`])
 				document.getElementById(id)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+		});
+	});
+	// A new group resets the zoom and compare; within a burst the zoom stays
+	// on the same spot (it is normalised, so it lines up frame to frame).
+	let lastGroup = -1;
+	$effect(() => {
+		const g = curGroup;
+		untrack(() => {
+			if (g === lastGroup) return;
+			lastGroup = g;
+			zoom = fitZoom();
+			sel = [];
+			if (mode === 'compare') mode = 'full';
 		});
 	});
 
@@ -102,9 +125,14 @@
 	}
 
 	async function pickFolder() {
-		const home = await homeDir();
-		const dir = await openDialog({ directory: true, defaultPath: await join(home, 'Photography') });
-		if (typeof dir === 'string') await load(dir);
+		// Start beside the open shoot, else in ~/Photography.
+		const start = view ? view.folder.replace(/\/[^/]+$/, '') : await join(await homeDir(), 'Photography');
+		try {
+			const dir = await api.pickFolder(start);
+			if (dir) await load(dir);
+		} catch (e) {
+			error = `open folder: ${e}`;
+		}
 	}
 
 	async function decide(changes: [number, Decision | null][]) {
@@ -152,12 +180,58 @@
 	});
 
 	const toggle = (s: Shot, mark: 'pick' | 'reject'): Decision => ({
-		mark: s.decision?.mark === mark ? 'none' : mark,
-		...(s.decision?.stars ? { stars: s.decision.stars } : {})
+		mark: s.decision?.mark === mark ? 'none' : mark
 	});
-	function stars(s: Shot, n: number): Decision {
-		const mark = s.decision?.mark ?? (s.verdict.mark === 'reject' ? 'none' : s.verdict.mark);
-		return s.decision?.stars === n ? { mark } : { mark, stars: n };
+	/** Mark the whole group; when it already all has that mark, take it off. */
+	function markGroup(mark: 'pick' | 'reject') {
+		if (!view) return;
+		const g = view.groups[curGroup] ?? [];
+		const all = g.every((i) => view!.shots[i]!.decision?.mark === mark);
+		decide(g.map((i) => [i, { mark: all ? 'none' : mark }]));
+	}
+
+	/** Mark or unmark a frame for compare; a third mark replaces the oldest. */
+	function toggleSel(i: number) {
+		sel = sel.includes(i) ? sel.filter((j) => j !== i) : [...sel, i].slice(-2);
+	}
+	/** Click on a frame: select it, or with Ctrl/Shift mark it for compare. */
+	function pickFrame(i: number, e: MouseEvent) {
+		if (e.ctrlKey || e.shiftKey || e.metaKey) toggleSel(i);
+		else if (mode === 'compare') setPane(i);
+		else cur = i;
+	}
+
+	/** Compare the marked frames: A | B, the mark | the current frame, or the current frame | its partner. */
+	function openCompare() {
+		const [a, b] =
+			sel.length === 2
+				? sel
+				: sel.length === 1 && sel[0] !== cur
+					? [sel[0]!, cur]
+					: [sel[0] ?? cur, partner];
+		if (a === undefined || b === undefined || a === b) return;
+		if (mode !== 'compare') back = mode;
+		pair = [a, b];
+		active = b === cur ? 1 : 0;
+		cur = pair[active]!;
+		mode = 'compare';
+	}
+	function setActive(k: number) {
+		active = k;
+		cur = pair[k]!;
+	}
+	/** Show frame `i` on the active side. */
+	function setPane(i: number) {
+		if (i === pair[1 - active]) return setActive(1 - active);
+		pair[active] = i;
+		cur = i;
+	}
+	/** Walk the active side through its group, skipping the other side's frame. */
+	function stepPane(d: number) {
+		const g = tilesOf(curGroup);
+		for (let k = g.indexOf(cur) + d; k >= 0 && k < g.length; k += d) {
+			if (g[k] !== pair[1 - active]) return setPane(g[k]!);
+		}
 	}
 
 	function step(d: number) {
@@ -192,6 +266,20 @@
 		}
 	}
 
+	async function setFullscreen(on: boolean) {
+		fullscreen = on;
+		if (on && mode === 'grid') mode = 'full';
+		try {
+			await getCurrentWindow().setFullscreen(on);
+		} catch (e) {
+			error = `fullscreen: ${e}`;
+		}
+	}
+	// Fullscreen always shows an image, even after compare hands back to the grid.
+	$effect(() => {
+		if (fullscreen && mode === 'grid') mode = 'full';
+	});
+
 	function onkeydown(e: KeyboardEvent) {
 		if (e.ctrlKey && e.key === 'o') {
 			e.preventDefault();
@@ -200,23 +288,31 @@
 		}
 		if (!view || !shot || e.ctrlKey || e.altKey || e.metaKey) return;
 		const k = e.key;
-		if (k === 'ArrowRight') step(1);
-		else if (k === 'ArrowLeft') step(-1);
+		const compare = mode === 'compare';
+		// Pick and reject by physical key, so Shift and the keyboard layout don't matter.
+		if (e.code === 'Digit2') e.shiftKey ? markGroup('pick') : decide([[cur, toggle(shot, 'pick')]]);
+		else if (e.code === 'KeyR') e.shiftKey ? markGroup('reject') : decide([[cur, toggle(shot, 'reject')]]);
+		else if (k === 'ArrowRight') compare ? stepPane(1) : step(1);
+		else if (k === 'ArrowLeft') compare ? stepPane(-1) : step(-1);
 		else if (k === 'ArrowDown') stepGroup(1);
 		else if (k === 'ArrowUp') stepGroup(-1);
-		else if (k === 'p' || k === 'P') decide([[cur, toggle(shot, 'pick')]]);
-		else if (k === 'x' || k === 'X') decide([[cur, toggle(shot, 'reject')]]);
+		else if (k === 'Tab' && compare) setActive(1 - active);
 		else if (k === 'u' || k === 'U') decide([[cur, null]]);
-		else if (k >= '1' && k <= '5') decide([[cur, stars(shot, Number(k))]]);
 		else if (k === 'Enter') acceptGroup();
-		else if (k === ' ') mode = mode === 'full' ? 'grid' : 'full';
-		else if (k === 'c' || k === 'C') mode = mode === 'compare' || partner === undefined ? 'grid' : 'compare';
+		else if (e.code === 'KeyF' && e.shiftKey) setFullscreen(!fullscreen);
+		else if (e.code === 'KeyF') fullscreen ? setFullscreen(false) : (mode = mode === 'full' ? 'grid' : 'full');
+		else if (k === 'm' || k === 'M') toggleSel(cur);
+		else if (k === 'c' || k === 'C') compare ? (mode = back) : openCompare();
 		else if (k === 'e' || k === 'E') eyesMode = !eyesMode;
 		else if (k === 'b' || k === 'B') boost = !boost;
 		else if (k === 's' || k === 'S') regroup(true);
 		else if (k === 'j' || k === 'J') regroup(false);
-		else if (k === 'Escape') mode = 'grid';
-		else return;
+		else if (k === 'Escape') {
+			if (fullscreen) setFullscreen(false);
+			else if (compare) mode = back;
+			else if (mode === 'full') mode = 'grid';
+			else sel = [];
+		} else return;
 		e.preventDefault();
 	}
 
@@ -226,6 +322,10 @@
 	});
 
 	const folderName = $derived(view?.folder.split('/').at(-1) ?? '');
+	const groupFrames = $derived(view?.groups[curGroup] ?? []);
+	/** 1-based place of the current frame in its whole group. */
+	const posInGroup = $derived(groupFrames.indexOf(cur) + 1);
+	const shotName = (i: number) => view?.shots[i]?.file.replace(/\.[^.]+$/, '').split('-').at(-1) ?? '';
 	const groupCounts = (gi: number) => {
 		const c = { pick: 0, reject: 0, pending: 0 };
 		for (const i of view?.groups[gi] ?? []) {
@@ -247,32 +347,35 @@
 <svelte:window {onkeydown} />
 
 <div class="app">
-	<header>
-		<strong class="logo">sift</strong>
-		<button onclick={pickFolder} title="Ctrl+O">Open folder…</button>
-		{#if view}
-			<span class="folder" title={view.folder}>{folderName}</span>
-			<div class="filters" role="group" aria-label="filter">
-				{#each ['all', 'pending', 'picked', 'rejected'] as const as f (f)}
-					<button class:on={filter === f} onclick={() => (filter = f)}>{f}</button>
-				{/each}
-			</div>
-			<span class="counts">
-				<span class="pick">★ {counts.pick}</span>
-				<span class="reject">✗ {counts.reject}</span>
-				<span>{counts.pending} to review</span>
-				<span class="muted">of {view.shots.length}</span>
-			</span>
-			<button
-				class="send"
-				onclick={send}
-				disabled={sending}
-				title="Send confirmed decisions; {counts.pending} unreviewed frame(s) are left out"
-			>
-				{sending ? 'Sending…' : 'Send to darktable'}
-			</button>
-		{/if}
-	</header>
+	{#if !fullscreen}
+		<header>
+			<strong class="logo">sift</strong>
+			{#if view}
+				<button class="folder" onclick={pickFolder} title="{view.folder}&#10;Click or Ctrl+O to open another folder">
+					{folderName} ▾
+				</button>
+				<div class="filters" role="group" aria-label="filter">
+					{#each ['all', 'pending', 'picked', 'rejected'] as const as f (f)}
+						<button class:on={filter === f} onclick={() => (filter = f)}>{f}</button>
+					{/each}
+				</div>
+				<span class="counts">
+					<span class="pick">★ {counts.pick}</span>
+					<span class="reject">✗ {counts.reject}</span>
+					<span>{counts.pending} to review</span>
+					<span class="muted">of {view.shots.length}</span>
+				</span>
+				<button
+					class="send"
+					onclick={send}
+					disabled={sending}
+					title="Send confirmed decisions; {counts.pending} unreviewed frame(s) are left out"
+				>
+					{sending ? 'Sending…' : 'Send to darktable'}
+				</button>
+			{/if}
+		</header>
+	{/if}
 
 	{#if error}
 		<div class="error" role="alert">
@@ -280,7 +383,7 @@
 		</div>
 	{/if}
 
-	{#if view && (sendNote || waiting > 0 || missing.length > 0)}
+	{#if view && !fullscreen && (sendNote || waiting > 0 || missing.length > 0)}
 		<div class="sendbar" role="status">
 			{#if sendNote}
 				{#if sendNote.written + sendNote.queued + sendNote.failed.length === 0}
@@ -324,55 +427,103 @@
 	{:else if !view}
 		<div class="welcome">
 			<p>Open a shoot folder to cull it.</p>
-			<button onclick={pickFolder}>Open folder…</button>
+			<button class="open" onclick={pickFolder}>Open folder…</button>
+			<p class="muted">or press <kbd>Ctrl+O</kbd></p>
 		</div>
 	{:else}
 		<div class="body">
-			<nav class="groups" aria-label="groups">
-				{#each visibleGroups as gi (gi)}
-					{@const c = groupCounts(gi)}
-					{@const cv = cover(gi)}
-					<button
-						id="group-{gi}"
-						class="group"
-						class:on={gi === curGroup}
-						class:done={c.pending === 0}
-						onclick={() => {
-							const f = tilesOf(gi)[0];
-							if (f !== undefined) cur = f;
-						}}
-					>
-						{#if cv && !cv.error}<img src={src(cv.thumb)} alt="" loading="lazy" />{/if}
-						<span class="gmeta">
-							<span>Group {gi + 1} · {view.groups[gi]?.length}</span>
+			{#if !fullscreen}
+				<nav class="groups" aria-label="groups">
+					{#each visibleGroups as gi (gi)}
+						{@const c = groupCounts(gi)}
+						{@const cv = cover(gi)}
+						<button
+							id="group-{gi}"
+							class="group"
+							class:on={gi === curGroup}
+							class:done={c.pending === 0}
+							onclick={() => {
+								const f = tilesOf(gi)[0];
+								if (f !== undefined) cur = f;
+							}}
+						>
+							{#if cv && !cv.error}<img src={src(cv.thumb)} alt="" loading="lazy" />{/if}
+							<span class="gmeta">
+								<span>Group {gi + 1} · {view.groups[gi]?.length}</span>
+								<span class="gcounts">
+									<span class="pick">★{c.pick}</span>
+									<span class="reject">✗{c.reject}</span>
+									{#if c.pending}<span class="muted">?{c.pending}</span>{:else}<span class="muted">✓</span>{/if}
+								</span>
+							</span>
+						</button>
+					{/each}
+				</nav>
+			{/if}
+
+			<main>
+				{#if !fullscreen}
+					{#key curGroup}
+						{@const c = groupCounts(curGroup)}
+						<div class="ghead">
+							<strong>Group {curGroup + 1}</strong>
+							<span>frame <b>{posInGroup}</b> of {groupFrames.length}</span>
+							{#if groupFrames.length > 1 && posInGroup === 1}<span class="edge">first</span>{/if}
+							{#if groupFrames.length > 1 && posInGroup === groupFrames.length}<span class="edge">last</span>{/if}
 							<span class="gcounts">
 								<span class="pick">★{c.pick}</span>
 								<span class="reject">✗{c.reject}</span>
-								{#if c.pending}<span class="muted">?{c.pending}</span>{:else}<span class="muted">✓</span>{/if}
+								{#if c.pending}<span class="muted">{c.pending} to review</span>{/if}
 							</span>
-						</span>
-					</button>
-				{/each}
-			</nav>
-
-			<main>
+							{#if mode === 'compare'}
+								<span class="hint">
+									comparing #{shotName(pair[0])} | #{shotName(pair[1])} · <kbd>Tab</kbd> switch side ·
+									<kbd>←→</kbd> change the {active === 0 ? 'left' : 'right'} side
+								</span>
+							{:else if sel.length}
+								<span class="hint">
+									A #{shotName(sel[0]!)}{#if sel[1] !== undefined} · B #{shotName(sel[1])}{/if} ·
+									<kbd>C</kbd> compare {sel.length === 2 ? 'A | B' : 'A | this frame'}
+								</span>
+							{:else}
+								<span class="hint muted">Ctrl-click or <kbd>M</kbd> marks frames to compare</span>
+							{/if}
+						</div>
+					{/key}
+				{/if}
 				{#if mode !== 'grid' && shot}
 					<div class="zoom">
 						<ZoomView
-							panes={mode === 'compare' && partner !== undefined ? [shot, view.shots[partner]!] : [shot]}
+							panes={mode === 'compare' ? pair.map((i) => view!.shots[i]!) : [shot]}
 							eyes={eyesMode}
 							{boost}
 							bind:zoom
+							{active}
+							onactivate={(k) => mode === 'compare' && setActive(k)}
 						/>
+						{#if fullscreen}
+							<div class="fspos">Group {curGroup + 1} · {posInGroup} / {groupFrames.length}</div>
+						{/if}
 					</div>
+					{#if !fullscreen}
+						<Filmstrip
+							shots={groupFrames.map((i) => ({ shot: view!.shots[i]!, index: i }))}
+							current={cur}
+							{sel}
+							onselect={pickFrame}
+						/>
+					{/if}
 				{:else}
 					<div class="tiles">
 						{#each tilesOf(curGroup) as i (i)}
+							{@const m = sel.indexOf(i)}
 							<Tile
 								shot={view.shots[i]!}
 								index={i}
+								pos="{groupFrames.indexOf(i) + 1}/{groupFrames.length}"
+								mark={m < 0 ? null : m === 0 ? 'A' : 'B'}
 								current={i === cur}
-								onselect={() => (cur = i)}
+								onselect={(e) => pickFrame(i, e)}
 								onopen={() => {
 									cur = i;
 									mode = 'full';
@@ -381,25 +532,28 @@
 						{/each}
 					</div>
 				{/if}
-				{#if tilesOf(curGroup).some((i) => judgeable(view!.shots[i]!))}
+				{#if !fullscreen && tilesOf(curGroup).some((i) => judgeable(view!.shots[i]!))}
 					<EyeStrip
 						shots={tilesOf(curGroup).map((i) => ({ shot: view!.shots[i]!, index: i }))}
 						current={cur}
+						{sel}
 						{boost}
-						onselect={(i) => (cur = i)}
+						onselect={pickFrame}
 					/>
 				{/if}
 			</main>
 		</div>
-		<footer>
-			{#if shot}<span class="now"><Badge {shot} /> {shot.file}</span>{/if}
-			<span class="keys">
-				<kbd>←→</kbd> frame <kbd>↑↓</kbd> group <kbd>P</kbd> pick <kbd>X</kbd> reject <kbd>U</kbd> clear
-				<kbd>1–5</kbd> stars <kbd>Enter</kbd> accept group <kbd>Space</kbd> full <kbd>C</kbd> compare
-				<kbd>E</kbd> eyes {eyesMode ? 'on' : 'off'} <kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split
-				<kbd>J</kbd> join
-			</span>
-		</footer>
+		{#if !fullscreen}
+			<footer>
+				{#if shot}<span class="now"><Badge {shot} /> {shot.file}</span>{/if}
+				<span class="keys">
+					<kbd>←→</kbd> frame <kbd>↑↓</kbd> group <kbd>2</kbd> pick <kbd>R</kbd> reject
+					<kbd>⇧2</kbd>/<kbd>⇧R</kbd> group <kbd>U</kbd> clear <kbd>Enter</kbd> accept group
+					<kbd>F</kbd> full <kbd>⇧F</kbd> fullscreen <kbd>M</kbd> mark <kbd>C</kbd> compare <kbd>E</kbd> eyes {eyesMode ? 'on' : 'off'}
+					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join
+				</span>
+			</footer>
+		{/if}
 	{/if}
 </div>
 
@@ -414,7 +568,6 @@
 		--accent: #e8b04a;
 		--pick: #4cc26a;
 		--reject: #e5534b;
-		--star: #f1c94b;
 		--chip: #2b2e35;
 		--strip-h: clamp(150px, 26vh, 300px);
 		color-scheme: dark;
@@ -459,6 +612,23 @@
 	}
 	.folder {
 		font-weight: 600;
+		background: transparent;
+		border-color: transparent;
+	}
+	.folder:hover {
+		border-color: var(--line);
+	}
+	.welcome .open {
+		font-size: 1.3rem;
+		padding: 0.9rem 2.6rem;
+		border-radius: 10px;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: #111;
+		font-weight: 600;
+	}
+	.welcome .open:hover {
+		filter: brightness(1.08);
 	}
 	.filters {
 		display: flex;
@@ -600,8 +770,51 @@
 		align-content: start;
 	}
 	.zoom {
+		position: relative;
 		flex: 1;
 		min-height: 0;
+	}
+	.fspos {
+		position: absolute;
+		top: 0.5rem;
+		right: 0.7rem;
+		font-size: 0.8rem;
+		color: #ddd;
+		text-shadow: 0 0 3px #000;
+		font-variant-numeric: tabular-nums;
+		pointer-events: none;
+	}
+	.ghead {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 1rem;
+		align-items: center;
+		padding: 0.35rem 0.8rem;
+		border-bottom: 1px solid var(--line);
+		background: var(--panel);
+		font-size: 0.85rem;
+		font-variant-numeric: tabular-nums;
+		animation: arrive 0.6s ease-out;
+	}
+	/* Replayed on every group change ({#key}), so crossing into a new group shows. */
+	@keyframes arrive {
+		from {
+			background: color-mix(in srgb, var(--accent) 35%, var(--panel));
+		}
+	}
+	.ghead b {
+		color: var(--accent);
+	}
+	.edge {
+		font-size: 0.72rem;
+		padding: 0 0.45rem;
+		border-radius: 99px;
+		border: 1px solid var(--accent);
+		color: var(--accent);
+	}
+	.hint {
+		margin-left: auto;
+		font-size: 0.78rem;
 	}
 	footer {
 		display: flex;

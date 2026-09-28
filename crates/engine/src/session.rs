@@ -13,9 +13,6 @@ use crate::export::Sent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub mark: Mark,
-    /// 1–5, or None to leave darktable's rating alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stars: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,5 +73,11 @@ mod tests {
         s.splits.insert("b".into());
         s.joins.insert("d".into());
         assert_eq!(s.regroup(&files, &auto), vec![vec![0], vec![1, 2, 3, 4]]);
+    }
+
+    #[test]
+    fn loads_sessions_that_still_have_stars() {
+        let s: Session = serde_json::from_str(r#"{"decisions":{"a":{"mark":"pick","stars":3}}}"#).unwrap();
+        assert_eq!(s.decisions["a"], Decision { mark: Mark::Pick });
     }
 }

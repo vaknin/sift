@@ -22,11 +22,15 @@ export interface Verdict {
 
 export interface Decision {
 	mark: Mark;
-	stars?: number;
 }
+
+/** One eye, classified with the culling thresholds (`cull::EyeState`). */
+export type EyeState = 'open' | 'half' | 'closed';
 
 export interface Face {
 	blink: [number, number];
+	/** Subject's right, left. */
+	eyes: [EyeState, EyeState];
 	eyeSharp: [number, number];
 	presence: number;
 	smile: number;

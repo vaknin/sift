@@ -2,6 +2,8 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import type { DarktableStatus, Decision, Mark, Report, Shot, View } from './types';
 
 export const initialFolder = () => invoke<string | null>('initial_folder');
+/** Folder chooser floating over the window; null when cancelled. */
+export const pickFolder = (start: string | null) => invoke<string | null>('pick_folder', { start });
 export const openFolder = (path: string) => invoke<View>('open_folder', { path });
 export const setDecisions = (changes: [string, Decision | null][]) => invoke<void>('set_decisions', { changes });
 export const regroup = (file: string, split: boolean) => invoke<View>('regroup', { file, split });

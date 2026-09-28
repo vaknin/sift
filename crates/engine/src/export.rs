@@ -1,7 +1,7 @@
 //! Sending decisions to darktable.
 //!
 //! Only the user's decisions are sent, never unconfirmed pre-marks:
-//! reject → rating -1; pick → green label (+ stars if set); both get
+//! reject → rating -1; pick → green label; both get
 //! `sift|reason|<reason>` tags. `Session::sent` remembers what sift changed
 //! and what was there before, so a re-send undoes marks the user removed and
 //! otherwise leaves the user's own ratings and labels alone.
@@ -95,8 +95,8 @@ pub fn targets(shots: &[ShotAnalysis], verdicts: &[Verdict], session: &Session) 
         let tags = || v.reasons.iter().map(|r| format!("{TAG_PREFIX}{}", r.slug())).collect();
         let t = match d.mark {
             Mark::Reject => Target { rating: Some(-1), green: false, tags: tags() },
-            Mark::Pick => Target { rating: d.stars.map(|n| n as i8), green: true, tags: tags() },
-            Mark::None => Target { rating: d.stars.map(|n| n as i8), ..Target::default() },
+            Mark::Pick => Target { rating: None, green: true, tags: tags() },
+            Mark::None => Target::default(),
         };
         if t != Target::default() {
             out.insert(s.file.clone(), t);
@@ -456,7 +456,7 @@ mod tests {
         send_to(&mut x, Some(target(Some(-1), false, &["sift|reason|eyes-closed"])), &mut sent);
         assert_eq!(x.text, text);
 
-        // Reject → pick without stars: the user's 2 stars come back, green added.
+        // Reject → pick: the user's 2 stars come back, green added.
         send_to(&mut x, Some(target(None, true, &["sift|reason|sharpest"])), &mut sent);
         assert_eq!(x.rating().unwrap(), Some(2));
         assert_eq!(x.list(xmp::LABELS).unwrap(), ["2"]);

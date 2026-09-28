@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
-use sift_engine::cull::{self, Config, Verdict};
+use sift_engine::cull::{self, Config, EyeState, Verdict};
 use sift_engine::export::{self, Darktable, Report};
 use sift_engine::session::{Decision, Session};
 use sift_engine::{Cache, Models, ShotAnalysis, analyze_folder, cache};
@@ -28,6 +28,8 @@ struct AppState {
 #[serde(rename_all = "camelCase")]
 struct FaceView {
     blink: [f32; 2],
+    /// `blink` classified with the culling thresholds (subject's right, left).
+    eyes: [EyeState; 2],
     eye_sharp: [f32; 2],
     presence: f32,
     smile: f32,
@@ -108,6 +110,7 @@ impl Open {
                     .iter()
                     .map(|f| FaceView {
                         blink: f.blink,
+                        eyes: f.blink.map(|b| cull::eye_state(b, &Config::default())),
                         eye_sharp: f.eye_sharp,
                         presence: f.presence,
                         smile: f.smile,
@@ -130,6 +133,39 @@ fn with_open<T>(state: &AppState, f: impl FnOnce(&mut Open) -> anyhow::Result<T>
 #[tauri::command]
 fn initial_folder() -> Option<PathBuf> {
     std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_dir())
+}
+
+/// Ask for a shoot folder. A GTK chooser made transient for the main window,
+/// so the compositor floats it over sift: the dialog plugin sets no parent
+/// on Linux, and Hyprland then tiles its chooser wherever focus happens to be.
+#[tauri::command]
+async fn pick_folder(window: tauri::WebviewWindow, start: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    use gtk::prelude::*;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let w = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let parent = w.gtk_window().ok();
+            let d = gtk::FileChooserDialog::with_buttons(
+                Some("Open a shoot folder"),
+                parent.as_ref(),
+                gtk::FileChooserAction::SelectFolder,
+                &[("Cancel", gtk::ResponseType::Cancel), ("Open", gtk::ResponseType::Accept)],
+            );
+            d.set_modal(true);
+            d.set_default_response(gtk::ResponseType::Accept);
+            if let Some(s) = &start {
+                d.set_current_folder(s);
+            }
+            d.connect_response(move |d, r| {
+                let _ = tx.send(if r == gtk::ResponseType::Accept { d.filename() } else { None });
+                // SAFETY: the dialog is only referenced by this handler and its own signals.
+                unsafe { d.destroy() };
+            });
+            d.show();
+        })
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || rx.recv().ok().flatten()).await.map_err(|e| e.to_string())
 }
 
 /// Analyse (or load from cache) a folder. Emits `progress` per shot.
@@ -236,10 +272,10 @@ fn darktable_status(state: State<'_, AppState>) -> Result<DarktableStatus, Strin
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             initial_folder,
+            pick_folder,
             open_folder,
             set_decisions,
             regroup,

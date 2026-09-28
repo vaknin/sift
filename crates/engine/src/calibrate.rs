@@ -222,7 +222,7 @@ mod tests {
     fn suggests_lower_blink_threshold_for_missed_half_blinks() {
         // Half-closed eyes (0.40) the user rejects, which the default 0.45 misses.
         let shots = vec![shot(0.0, 0.05), shot(1.0, 0.40), shot(2.0, 0.42), shot(3.0, 0.10), shot(4.0, 0.60)];
-        let d = |m| Decision { mark: m, stars: None };
+        let d = |m| Decision { mark: m };
         let decisions: BTreeMap<_, _> = [
             ("0.CR3", d(Mark::Pick)),
             ("1.CR3", d(Mark::Reject)),

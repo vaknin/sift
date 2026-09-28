@@ -128,6 +128,25 @@ fn usable<'a>(s: &'a ShotAnalysis, cfg: &Config) -> Vec<&'a FaceMetrics> {
     s.faces.iter().filter(|f| f.presence >= cfg.min_presence && f.eye_px[0].max(f.eye_px[1]) >= cfg.min_eye_px).collect()
 }
 
+/// One eye as the UI shows it, from its eyeBlink score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EyeState {
+    Open,
+    Half,
+    Closed,
+}
+
+pub fn eye_state(blink: f32, cfg: &Config) -> EyeState {
+    if blink >= cfg.blink_closed {
+        EyeState::Closed
+    } else if blink >= cfg.blink_both {
+        EyeState::Half
+    } else {
+        EyeState::Open
+    }
+}
+
 fn eyes_closed(f: &FaceMetrics, cfg: &Config) -> bool {
     f.blink[0].max(f.blink[1]) >= cfg.blink_closed && f.blink[0].min(f.blink[1]) >= cfg.blink_both
 }

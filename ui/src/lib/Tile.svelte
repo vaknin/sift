@@ -6,10 +6,22 @@
 	let {
 		shot,
 		index,
+		pos,
+		mark,
 		current,
 		onselect,
 		onopen
-	}: { shot: Shot; index: number; current: boolean; onselect: () => void; onopen: () => void } = $props();
+	}: {
+		shot: Shot;
+		index: number;
+		/** Place in the group, e.g. "3/7". */
+		pos: string;
+		/** 'A' or 'B' when marked for compare. */
+		mark: string | null;
+		current: boolean;
+		onselect: (e: MouseEvent) => void;
+		onopen: () => void;
+	} = $props();
 
 	const num = $derived(shot.file.replace(/\.[^.]+$/, '').split('-').at(-1));
 </script>
@@ -22,7 +34,8 @@
 			<img src={src(shot.thumb)} alt={shot.file} loading="lazy" draggable="false" />
 		{/if}
 		<div class="corner"><Badge {shot} /></div>
-		<div class="num">#{num}</div>
+		{#if mark}<div class="ab">{mark}</div>{/if}
+		<div class="num"><span class="pos">{pos}</span> #{num}</div>
 	</div>
 	<div class="chips">
 		{#each shot.verdict.reasons as r (r)}
@@ -85,6 +98,22 @@
 		font-size: 0.75rem;
 		color: #ddd;
 		text-shadow: 0 0 3px #000;
+	}
+	.pos {
+		color: var(--accent);
+		font-variant-numeric: tabular-nums;
+		margin-right: 0.3rem;
+	}
+	.ab {
+		position: absolute;
+		top: 0.35rem;
+		right: 0.4rem;
+		font-size: 0.8rem;
+		font-weight: 700;
+		padding: 0 0.35rem;
+		border-radius: 4px;
+		background: var(--accent);
+		color: #111;
 	}
 	.chips {
 		display: flex;
