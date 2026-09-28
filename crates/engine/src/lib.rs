@@ -5,6 +5,7 @@ pub mod export;
 pub mod face;
 pub mod measure;
 pub mod preview;
+pub mod reframe;
 mod resize;
 pub mod session;
 pub mod xmp;

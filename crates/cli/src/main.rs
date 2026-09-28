@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sift_engine::calibrate::{self, Agreement, Shoot};
 use sift_engine::cull::{self, Config, Mark};
 use sift_engine::export::{self, Darktable};
+use sift_engine::preview;
+use sift_engine::reframe::{self, ReframeConfig, Scene};
 use sift_engine::session::Session;
 use sift_engine::{Models, analyze_folder};
 
@@ -37,6 +39,13 @@ enum Cmd {
         #[arg(required = true)]
         dirs: Vec<PathBuf>,
     },
+    /// Suggest crops for one frame.
+    Reframe {
+        file: PathBuf,
+        /// Write each suggestion as a JPEG here, plus an overview with the crops outlined.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -44,6 +53,7 @@ fn main() -> Result<()> {
         Cmd::Analyze { dir, json } => run_analyze(&dir, json),
         Cmd::Export { dir, dry_run } => run_export(&dir, dry_run),
         Cmd::Calibrate { dirs } => run_calibrate(&dirs),
+        Cmd::Reframe { file, out } => run_reframe(&file, out.as_deref()),
     }
 }
 
@@ -181,4 +191,79 @@ fn run_calibrate(dirs: &[PathBuf]) -> Result<()> {
         println!("\nFew decisions so far: treat suggestions as hints; confirm over more shoots.");
     }
     Ok(())
+}
+
+/// Outline colours for the overview, in suggestion order.
+const COLOURS: [[u8; 3]; 6] = [[255, 60, 60], [60, 220, 60], [70, 140, 255], [255, 210, 0], [230, 80, 255], [255, 255, 255]];
+const COLOUR_NAMES: [&str; 6] = ["red", "green", "blue", "yellow", "magenta", "white"];
+
+fn run_reframe(file: &Path, out: Option<&Path>) -> Result<()> {
+    let shot = preview::read_exif(&[file.to_path_buf()])?.pop().context("no such photo")?;
+    let t0 = Instant::now();
+    let img = preview::load(&shot)?;
+    let models = Models::new()?;
+    let t1 = Instant::now();
+    let scene = Scene::build(&models, &img)?;
+    let t2 = Instant::now();
+    let cfg = ReframeConfig::default();
+    let sugg = reframe::suggest(&scene, &cfg);
+    eprintln!(
+        "load {:.1?} · scene {:.1?} · suggest {:.1?} · {} face(s)",
+        t1 - t0,
+        t2 - t1,
+        t2.elapsed(),
+        scene.faces.len()
+    );
+    if let Some(f) = scene.faces.first() {
+        eprintln!("face yaw {:+.2} · eyes y {:.3}", f.yaw, (f.eyes[0][1] + f.eyes[1][1]) / 2.0);
+    }
+    for (i, s) in sugg.iter().enumerate() {
+        let [x, y, w, h] = s.crop.pixels(scene.width, scene.height);
+        let notes: Vec<String> = s.notes.iter().map(|n| serde_json::to_string(n).unwrap().trim_matches('"').to_string()).collect();
+        let t = reframe::terms(&scene, &cfg, &s.crop).unwrap_or_default();
+        println!(
+            "{} {:<7} {:<5} {w:>4}×{h:<4} at {x:>4},{y:<4} {:>4.1} MP {:>4} px  score {:+.2}  {}",
+            i + 1,
+            COLOUR_NAMES[i % 6],
+            s.ratio.to_string(),
+            (w * h) as f32 / 1e6,
+            s.crop.long_side(scene.width, scene.height),
+            s.score,
+            notes.join(" ")
+        );
+        println!(
+            "    eyes {:.3} lead {:.3} cut {:.0} bright {:.2} busy {:.2} pop {:.2} clutter {:.2}",
+            t.eyes, t.lead, t.cut, t.bright, t.busy, t.pop, t.clutter
+        );
+    }
+    let Some(out) = out else { return Ok(()) };
+    std::fs::create_dir_all(out)?;
+    let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+    let fit = |im: &image::RgbImage, long: u32| {
+        let s = (long as f32 / im.width().max(im.height()) as f32).min(1.0);
+        image::imageops::resize(im, (im.width() as f32 * s) as u32, (im.height() as f32 * s) as u32, image::imageops::FilterType::Triangle)
+    };
+    let mut overview = fit(&img, 2000);
+    for (i, s) in sugg.iter().enumerate() {
+        let [x, y, w, h] = s.crop.pixels(img.width(), img.height());
+        let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
+        let name = format!("{stem}_{}_{}.jpg", i + 1, s.ratio.to_string().replace(':', "x"));
+        fit(&crop, 1600).save(out.join(&name))?;
+        let [x, y, w, h] = s.crop.pixels(overview.width(), overview.height());
+        outline(&mut overview, [x, y, w, h], COLOURS[i % 6], 4 + 2 * (i % 2) as u32);
+    }
+    overview.save(out.join(format!("{stem}_overview.jpg")))?;
+    eprintln!("wrote {} crops and an overview to {}", sugg.len(), out.display());
+    Ok(())
+}
+
+fn outline(img: &mut image::RgbImage, [x, y, w, h]: [u32; 4], c: [u8; 3], t: u32) {
+    let (iw, ih) = img.dimensions();
+    for py in y..(y + h).min(ih) {
+        for px in x..(x + w).min(iw) {
+            if px < x + t || px + t >= x + w || py < y + t || py + t >= y + h {
+                img.put_pixel(px, py, image::Rgb(c));
+            }
+        }
+    }
 }
