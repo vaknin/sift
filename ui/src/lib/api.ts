@@ -1,0 +1,49 @@
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import type { DarktableStatus, Decision, Mark, Report, Shot, View } from './types';
+
+export const initialFolder = () => invoke<string | null>('initial_folder');
+export const openFolder = (path: string) => invoke<View>('open_folder', { path });
+export const setDecisions = (changes: [string, Decision | null][]) => invoke<void>('set_decisions', { changes });
+export const regroup = (file: string, split: boolean) => invoke<View>('regroup', { file, split });
+export const sendToDarktable = () => invoke<Report>('send_to_darktable');
+export const darktableStatus = () => invoke<DarktableStatus>('darktable_status');
+
+export const src = (path: string) => convertFileSrc(path);
+
+/** The user's decision when there is one, else the pre-mark. */
+export const effective = (s: Shot): Mark => s.decision?.mark ?? s.verdict.mark;
+
+export const matches = (s: Shot, f: 'all' | 'pending' | 'picked' | 'rejected'): boolean =>
+	f === 'all' ||
+	(f === 'pending' && s.decision === null) ||
+	(f === 'picked' && effective(s) === 'pick') ||
+	(f === 'rejected' && effective(s) === 'reject');
+
+const REASON_TEXT: Record<string, string> = {
+	'eyes-closed': 'eyes closed',
+	'soft-eyes': 'soft eyes',
+	'no-face': 'no face',
+	'face-hidden': 'face hidden',
+	'small-face': 'small face',
+	'face-cut': 'face cut',
+	sharpest: 'sharpest',
+	smile: 'smile',
+	'soft-frame': 'soft'
+};
+export const reasonText = (r: string) => REASON_TEXT[r] ?? r;
+export const reasonTone = (r: string): 'bad' | 'good' | 'info' =>
+	r === 'eyes-closed' || r === 'soft-eyes' || r === 'soft-frame' || r === 'face-cut'
+		? 'bad'
+		: r === 'sharpest' || r === 'smile'
+			? 'good'
+			: 'info';
+
+/** CSS brightness that lifts a low-key face to a readable level for inspection. */
+export const lift = (s: Shot): number => {
+	const l = s.faces[0]?.faceLuma;
+	return l === undefined || l <= 0 ? 1 : Math.min(3, Math.max(1, 110 / l));
+};
+
+/** Whether the frame has a face the analysis could judge (eye crop worth showing). */
+export const judgeable = (s: Shot): boolean =>
+	s.eyes.length > 0 && !s.verdict.reasons.some((r) => r === 'no-face' || r === 'face-hidden' || r === 'small-face');
