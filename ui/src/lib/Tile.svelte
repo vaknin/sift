@@ -35,7 +35,10 @@
 		{/if}
 		<div class="corner"><Badge {shot} /></div>
 		{#if mark}<div class="ab">{mark}</div>{/if}
-		<div class="num"><span class="pos">{pos}</span> #{num}</div>
+		<div class="num">
+			{#if shot.crops.length}<span class="cut" title="{shot.crops.length} crop(s) kept">✂{shot.crops.length}</span>{/if}
+			<span class="pos">{pos}</span> #{num}
+		</div>
 	</div>
 	<div class="chips">
 		{#each shot.verdict.reasons as r (r)}
@@ -98,6 +101,10 @@
 		font-size: 0.75rem;
 		color: #ddd;
 		text-shadow: 0 0 3px #000;
+	}
+	.cut {
+		color: var(--pick);
+		margin-right: 0.3rem;
 	}
 	.pos {
 		color: var(--accent);

@@ -31,7 +31,7 @@
 		>
 			{#if !shot.error}<img src={src(shot.thumb)} alt="" loading="lazy" draggable="false" />{/if}
 			<span class="badge"><Badge {shot} /></span>
-			<span class="pos">{k + 1}</span>
+			<span class="pos">{#if shot.crops.length}<span class="cut">✂{shot.crops.length}</span>{/if}{k + 1}</span>
 			{#if m >= 0}<span class="ab">{m === 0 ? 'A' : 'B'}</span>{/if}
 		</button>
 	{/each}
@@ -85,6 +85,10 @@
 		color: #fff;
 		text-shadow: 0 0 3px #000;
 		font-variant-numeric: tabular-nums;
+	}
+	.cut {
+		color: var(--pick);
+		margin-right: 0.2rem;
 	}
 	.ab {
 		position: absolute;

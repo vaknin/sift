@@ -1,5 +1,5 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-import type { DarktableStatus, Decision, Mark, Report, Shot, View } from './types';
+import type { Crop, DarktableStatus, Decision, KeptCrop, Mark, Note, Ratio, ReframeView, Report, Shot, View } from './types';
 
 export const initialFolder = () => invoke<string | null>('initial_folder');
 /** Folder chooser floating over the window; null when cancelled. */
@@ -9,6 +9,10 @@ export const setDecisions = (changes: [string, Decision | null][]) => invoke<voi
 export const regroup = (file: string, split: boolean) => invoke<View>('regroup', { file, split });
 export const sendToDarktable = () => invoke<Report>('send_to_darktable');
 export const darktableStatus = () => invoke<DarktableStatus>('darktable_status');
+/** Crop suggestions; the first call for a frame takes a second or so. */
+export const reframe = (file: string) => invoke<ReframeView>('reframe', { file });
+/** Replace a frame's kept crops; returns them with their ids. */
+export const setCrops = (file: string, crops: [Crop, Ratio][]) => invoke<KeptCrop[]>('set_crops', { file, crops });
 
 export const src = (path: string) => convertFileSrc(path);
 
@@ -49,3 +53,18 @@ export const lift = (s: Shot): number => {
 /** Whether the frame has a face the analysis could judge (eye crop worth showing). */
 export const judgeable = (s: Shot): boolean =>
 	s.eyes.length > 0 && !s.verdict.reasons.some((r) => r === 'no-face' || r === 'face-hidden' || r === 'small-face');
+
+const NOTE_TEXT: Record<Note, string> = {
+	original: 'as shot',
+	'eyes-on-third': 'eyes on third',
+	'lead-room': 'lead room',
+	centered: 'centred',
+	'clean-edges': 'clean edges',
+	'subject-pops': 'subject pops'
+};
+export const noteText = (n: Note) => NOTE_TEXT[n] ?? n;
+export const ratioText = (r: Ratio) => `${r[0]}:${r[1]}`;
+
+/** Long side of `crop` in pixels of a `width` × `height` frame (`Crop::long_side`). */
+export const longSide = (crop: Crop, width: number, height: number): number =>
+	Math.round(Math.max(crop.w * width, crop.h * height));

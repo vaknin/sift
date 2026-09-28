@@ -49,12 +49,16 @@ export interface Shot {
 	thumb: string;
 	eyes: string[];
 	faces: Face[];
+	/** Crops kept in Reframe. */
+	crops: KeptCrop[];
 }
 
 export interface View {
 	folder: string;
 	shots: Shot[];
 	groups: number[][];
+	/** Smallest long side a Reframe crop may have, full-resolution pixels. */
+	minLong: number;
 }
 
 export interface Progress {
@@ -80,4 +84,55 @@ export interface Report {
 export interface DarktableStatus {
 	queued: number;
 	missing: string[];
+}
+
+/** x, y, w, h as fractions of the upright frame (`reframe::Crop`). */
+export interface Crop {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+}
+
+/** Width : height. */
+export type Ratio = [number, number];
+
+/** Why a suggestion scored well (`reframe::Note`). */
+export type Note = 'original' | 'eyes-on-third' | 'lead-room' | 'centered' | 'clean-edges' | 'subject-pops';
+
+export interface Suggestion {
+	crop: Crop;
+	ratio: Ratio;
+	score: number;
+	notes: Note[];
+}
+
+export interface KeptCrop {
+	id: string;
+	crop: Crop;
+	ratio: Ratio;
+}
+
+/** A face in frame fractions. */
+export interface FaceBox {
+	/** x, y, w, h. */
+	bbox: [number, number, number, number];
+	/** Subject's right, left. */
+	eyes: [[number, number], [number, number]];
+	chin: [number, number];
+	forehead: [number, number];
+}
+
+export interface ReframeView {
+	/** Full-resolution size, upright. */
+	width: number;
+	height: number;
+	/** Best first; the last is the frame as shot. */
+	suggestions: Suggestion[];
+	/** Largest first; the first is the subject. */
+	faces: FaceBox[];
+	/** Space around the face box, in face heights: sides, top, bottom. */
+	margin: [number, number, number];
+	/** Band under the chin a bottom edge shouldn't cut, in face heights. */
+	chinBand: number;
 }

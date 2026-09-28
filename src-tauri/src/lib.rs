@@ -7,6 +7,8 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 use sift_engine::cull::{self, Config, EyeState, Verdict};
 use sift_engine::export::{self, Darktable, Report};
+use sift_engine::preview;
+use sift_engine::reframe::{self, Crop, KeptCrop, Ratio, ReframeConfig, Scene, Suggestion};
 use sift_engine::session::{Decision, Session};
 use sift_engine::{Cache, Models, ShotAnalysis, analyze_folder, cache};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -51,6 +53,8 @@ struct ShotView {
     /// Full-resolution eye crops, one per face.
     eyes: Vec<PathBuf>,
     faces: Vec<FaceView>,
+    /// Crops kept in Reframe.
+    crops: Vec<KeptCrop>,
 }
 
 #[derive(Serialize)]
@@ -60,6 +64,35 @@ struct View {
     shots: Vec<ShotView>,
     /// Indices into `shots`, in capture order.
     groups: Vec<Vec<usize>>,
+    /// Smallest long side a Reframe crop may have, in full-resolution pixels.
+    min_long: u32,
+}
+
+/// A face as Reframe draws and snaps to it, normalised to the upright frame.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceBox {
+    /// x, y, w, h.
+    bbox: [f32; 4],
+    /// Subject's right, left.
+    eyes: [[f32; 2]; 2],
+    chin: [f32; 2],
+    forehead: [f32; 2],
+}
+
+/// Crop suggestions for one frame, plus what the UI needs to apply the same rules.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReframeView {
+    /// Full-resolution size, upright.
+    width: u32,
+    height: u32,
+    suggestions: Vec<Suggestion>,
+    faces: Vec<FaceBox>,
+    /// Space around the face box, in face heights: sides, top, bottom.
+    margin: [f32; 3],
+    /// Depth of the band under the chin a bottom edge shouldn't cut, in face heights.
+    chin_band: f32,
 }
 
 #[derive(Clone, Serialize)]
@@ -117,9 +150,21 @@ impl Open {
                         face_luma: f.face_luma,
                     })
                     .collect(),
+                crops: self.session.crops.get(&s.file).cloned().unwrap_or_default(),
             })
             .collect();
-        View { folder: self.cache.folder.clone(), shots, groups }
+        View { folder: self.cache.folder.clone(), shots, groups, min_long: ReframeConfig::default().min_long }
+    }
+}
+
+/// The face models, loaded on first use.
+fn models(state: &AppState) -> Result<&Models, String> {
+    match state.models.get() {
+        Some(m) => Ok(m),
+        None => {
+            let m = Models::new().map_err(|e| format!("loading models: {e:#}"))?;
+            Ok(state.models.get_or_init(|| m))
+        }
     }
 }
 
@@ -173,13 +218,7 @@ async fn pick_folder(window: tauri::WebviewWindow, start: Option<PathBuf>) -> Re
 async fn open_folder(app: AppHandle, path: PathBuf) -> Result<View, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<View, String> {
         let state = app.state::<AppState>();
-        let models = match state.models.get() {
-            Some(m) => m,
-            None => {
-                let m = Models::new().map_err(|e| format!("loading models: {e:#}"))?;
-                state.models.get_or_init(|| m)
-            }
-        };
+        let models = models(&state)?;
         let thumbs = Cache::for_folder(&path).map_err(|e| format!("{e:#}"))?;
         let on_shot = |done: usize, total: usize, s: &ShotAnalysis| {
             let thumb = s.error.is_none().then(|| thumbs.img(&cache::thumb_name(s)));
@@ -234,6 +273,50 @@ fn regroup(state: State<'_, AppState>, file: String, split: bool) -> Result<View
     })
 }
 
+/// Crop suggestions for `file`. The scene is built on first use (a second or
+/// so) and cached; the folder lock is not held meanwhile, so calls may overlap.
+#[tauri::command]
+async fn reframe(app: AppHandle, file: String) -> Result<ReframeView, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<ReframeView, String> {
+        let state = app.state::<AppState>();
+        let cache = with_open(&state, |o| Ok(Cache { dir: o.cache.dir.clone(), folder: o.cache.folder.clone() }))?;
+        let models = models(&state)?;
+        let err = |e: anyhow::Error| format!("{file}: {e:#}");
+        let shot = preview::read_exif(&[cache.folder.join(&file)]).map_err(err)?.pop().ok_or(format!("{file}: not found"))?;
+        let scene = Scene::cached(models, &shot, &cache).map_err(err)?;
+        let cfg = ReframeConfig::default();
+        Ok(ReframeView {
+            width: scene.width,
+            height: scene.height,
+            suggestions: reframe::suggest(&scene, &cfg),
+            faces: scene
+                .faces
+                .iter()
+                .map(|f| FaceBox { bbox: f.bbox, eyes: f.eyes, chin: f.chin, forehead: f.forehead })
+                .collect(),
+            margin: cfg.margin,
+            chin_band: cfg.chin_band,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Replace `file`'s kept crops, saving the session. Returns them with their ids.
+#[tauri::command]
+fn set_crops(state: State<'_, AppState>, file: String, crops: Vec<(Crop, Ratio)>) -> Result<Vec<KeptCrop>, String> {
+    with_open(&state, |o| {
+        let kept: Vec<KeptCrop> = crops.into_iter().map(|(crop, ratio)| KeptCrop { id: crop.id(), crop, ratio }).collect();
+        if kept.is_empty() {
+            o.session.crops.remove(&file);
+        } else {
+            o.session.crops.insert(file, kept.clone());
+        }
+        o.session.save(&o.cache)?;
+        Ok(kept)
+    })
+}
+
 /// Send the confirmed decisions to darktable: sidecars for files it hasn't
 /// imported, a queue for sift.lua for the rest.
 #[tauri::command]
@@ -279,6 +362,8 @@ pub fn run() {
             open_folder,
             set_decisions,
             regroup,
+            reframe,
+            set_crops,
             send_to_darktable,
             darktable_status
         ])

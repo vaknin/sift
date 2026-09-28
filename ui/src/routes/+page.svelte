@@ -1,16 +1,18 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { homeDir, join } from '@tauri-apps/api/path';
 	import * as api from '$lib/api';
 	import { effective, judgeable, matches, src } from '$lib/api';
-	import type { Decision, Filter, Progress, Shot, View } from '$lib/types';
+	import type { Crop, Decision, Filter, Progress, Ratio, ReframeView, Shot, View } from '$lib/types';
 	import Tile from '$lib/Tile.svelte';
 	import EyeStrip from '$lib/EyeStrip.svelte';
 	import Filmstrip from '$lib/Filmstrip.svelte';
 	import Badge from '$lib/Badge.svelte';
 	import ZoomView, { fitZoom, type Zoom } from '$lib/ZoomView.svelte';
+	import Reframe from '$lib/Reframe.svelte';
 
 	let view = $state<View | null>(null);
 	let progress = $state<Progress | null>(null);
@@ -38,6 +40,17 @@
 	let waiting = $state(0);
 	/** Files sift.lua couldn't find in darktable. */
 	let missing = $state<string[]>([]);
+	/** Cull decides; Reframe crops the picks. */
+	let stage = $state<'cull' | 'reframe'>('cull');
+	/** The picks when Reframe opened, so a frame unpicked there stays until you leave. */
+	let picks = $state<number[]>([]);
+	/** Suggestions per file, or why they failed; kept while the folder is open. */
+	const reframes = new SvelteMap<string, ReframeView | { error: string }>();
+	/** The file whose suggestions are being made. */
+	let reframing = $state<string | null>(null);
+	let reframer = $state<{ handleKey: (e: KeyboardEvent) => boolean }>();
+	/** Bumped to stop a running prefetch loop. */
+	let prefetchGen = 0;
 
 	const groupOf = $derived.by(() => {
 		const out: number[] = [];
@@ -71,16 +84,18 @@
 	});
 
 	// Keep the current frame visible under the active filter (compare keeps
-	// its two frames even when a decision filters them out).
+	// its two frames even when a decision filters them out, Reframe its picks).
 	$effect(() => {
-		if (mode !== 'compare' && flat.length && !flat.includes(cur)) cur = flat.find((i) => i > cur) ?? flat.at(-1)!;
+		if (stage === 'cull' && mode !== 'compare' && flat.length && !flat.includes(cur))
+			cur = flat.find((i) => i > cur) ?? flat.at(-1)!;
 	});
 	// Scroll the current tile, frame, eye crop and group into view.
 	$effect(() => {
 		const c = cur;
 		const g = curGroup;
+		void stage; // the rail and tiles appear on a stage change
 		tick().then(() => {
-			for (const id of [`tile-${c}`, `film-${c}`, `eyes-${c}`, `group-${g}`])
+			for (const id of [`tile-${c}`, `film-${c}`, `eyes-${c}`, `group-${g}`, `pick-${c}`])
 				document.getElementById(id)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 		});
 	});
@@ -105,6 +120,8 @@
 		waiting = 0;
 		missing = [];
 		recent = [];
+		stage = 'cull';
+		reframes.clear();
 		progress = { done: 0, total: 0, thumb: null };
 		const unlisten = await listen<Progress>('progress', (e) => {
 			progress = e.payload;
@@ -280,11 +297,81 @@
 		if (fullscreen && mode === 'grid') mode = 'full';
 	});
 
+	/** Enter Reframe on the current frame if it is a pick, else the next pick; leave on the frame being reframed. */
+	function toggleStage() {
+		if (!view) return;
+		if (stage === 'reframe') {
+			stage = 'cull';
+			return;
+		}
+		const p = view.shots.flatMap((s, i) => (effective(s) === 'pick' ? [i] : []));
+		if (p.length === 0) {
+			error = 'Nothing picked yet: pick frames with 2, then press X to reframe them.';
+			return;
+		}
+		picks = p;
+		cur = p.find((i) => i >= cur) ?? p.at(-1)!;
+		if (mode === 'compare') mode = back;
+		stage = 'reframe';
+		prefetch();
+	}
+	function stepPick(d: number) {
+		const k = picks.indexOf(cur);
+		const next = picks[Math.min(picks.length - 1, Math.max(0, k + d))];
+		if (next !== undefined) cur = next;
+	}
+	/** Make suggestions one frame at a time: the current pick first, then the ones after it, then before. */
+	async function prefetch() {
+		const folder = view?.folder;
+		const gen = ++prefetchGen;
+		while (gen === prefetchGen && stage === 'reframe' && view && view.folder === folder) {
+			const k = Math.max(0, picks.indexOf(cur));
+			const order = [...picks.slice(k), ...picks.slice(0, k).reverse()];
+			const next = order
+				.map((i) => view!.shots[i]!)
+				.find((s) => !s.error && !reframes.has(s.file) && s.file !== reframing);
+			if (!next) break;
+			reframing = next.file;
+			try {
+				const r = await api.reframe(next.file);
+				if (view?.folder === folder) reframes.set(next.file, r);
+			} catch (e) {
+				if (view?.folder === folder) reframes.set(next.file, { error: String(e) });
+			} finally {
+				reframing = null;
+			}
+		}
+	}
+	async function keepCrops(i: number, crops: [Crop, Ratio][]): Promise<boolean> {
+		const s = view?.shots[i];
+		if (!s) return false;
+		try {
+			s.crops = await api.setCrops(s.file, crops);
+			return true;
+		} catch (e) {
+			error = `could not save crops: ${e}`;
+			return false;
+		}
+	}
+
 	function onkeydown(e: KeyboardEvent) {
 		if (e.ctrlKey && e.key === 'o') {
 			e.preventDefault();
 			pickFolder();
 			return;
+		}
+		if (view && shot && stage === 'reframe') {
+			const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
+			const toCull = plain && ((e.code === 'Digit2' && !e.shiftKey) || (e.code === 'KeyR' && !e.shiftKey) || (e.code === 'KeyF' && e.shiftKey));
+			if (!toCull) {
+				if (plain && e.code === 'KeyX') toggleStage();
+				else if (reframer?.handleKey(e)) {
+					// handled
+				} else if (plain && e.key === 'Escape') toggleStage();
+				else return;
+				e.preventDefault();
+				return;
+			}
 		}
 		if (!view || !shot || e.ctrlKey || e.altKey || e.metaKey) return;
 		const k = e.key;
@@ -307,6 +394,7 @@
 		else if (k === 'b' || k === 'B') boost = !boost;
 		else if (k === 's' || k === 'S') regroup(true);
 		else if (k === 'j' || k === 'J') regroup(false);
+		else if (e.code === 'KeyX') toggleStage();
 		else if (k === 'Escape') {
 			if (fullscreen) setFullscreen(false);
 			else if (compare) mode = back;
@@ -322,6 +410,8 @@
 	});
 
 	const folderName = $derived(view?.folder.split('/').at(-1) ?? '');
+	const keptCount = $derived(picks.reduce((n, i) => n + (view?.shots[i]?.crops.length ?? 0), 0));
+	const reframeData = $derived(shot ? reframes.get(shot.file) : undefined);
 	const groupFrames = $derived(view?.groups[curGroup] ?? []);
 	/** 1-based place of the current frame in its whole group. */
 	const posInGroup = $derived(groupFrames.indexOf(cur) + 1);
@@ -354,17 +444,30 @@
 				<button class="folder" onclick={pickFolder} title="{view.folder}&#10;Click or Ctrl+O to open another folder">
 					{folderName} ▾
 				</button>
-				<div class="filters" role="group" aria-label="filter">
-					{#each ['all', 'pending', 'picked', 'rejected'] as const as f (f)}
-						<button class:on={filter === f} onclick={() => (filter = f)}>{f}</button>
-					{/each}
+				<div class="filters" role="group" aria-label="stage">
+					<button class:on={stage === 'cull'} onclick={() => stage === 'reframe' && toggleStage()} title="X">Cull</button>
+					<button class:on={stage === 'reframe'} onclick={() => stage === 'cull' && toggleStage()} title="X">
+						Reframe ({stage === 'reframe' ? picks.length : counts.pick})
+					</button>
 				</div>
-				<span class="counts">
-					<span class="pick">★ {counts.pick}</span>
-					<span class="reject">✗ {counts.reject}</span>
-					<span>{counts.pending} to review</span>
-					<span class="muted">of {view.shots.length}</span>
-				</span>
+				{#if stage === 'reframe'}
+					<span class="counts">
+						<span><b>{picks.indexOf(cur) + 1}</b> / {picks.length}</span>
+						<span class="pick">{keptCount} crop{keptCount === 1 ? '' : 's'} kept</span>
+					</span>
+				{:else}
+					<div class="filters" role="group" aria-label="filter">
+						{#each ['all', 'pending', 'picked', 'rejected'] as const as f (f)}
+							<button class:on={filter === f} onclick={() => (filter = f)}>{f}</button>
+						{/each}
+					</div>
+					<span class="counts">
+						<span class="pick">★ {counts.pick}</span>
+						<span class="reject">✗ {counts.reject}</span>
+						<span>{counts.pending} to review</span>
+						<span class="muted">of {view.shots.length}</span>
+					</span>
+				{/if}
 				<button
 					class="send"
 					onclick={send}
@@ -432,6 +535,42 @@
 		</div>
 	{:else}
 		<div class="body">
+			{#if stage === 'reframe' && shot}
+				{#if !fullscreen}
+					<nav class="groups" aria-label="picks">
+						{#each picks as i (i)}
+							{@const s = view.shots[i]!}
+							{@const r = reframes.get(s.file)}
+							<button id="pick-{i}" class="group" class:on={i === cur} class:unpicked={effective(s) !== 'pick'} onclick={() => (cur = i)}>
+								{#if !s.error}<img src={src(s.thumb)} alt="" loading="lazy" />{/if}
+								<span class="gmeta">
+									<span class="pname">#{shotName(i)}</span>
+									<span class="gcounts">
+										{#if s.crops.length}<span class="pick">✂{s.crops.length}</span>{/if}
+										{#if r && 'faces' in r && r.faces.length === 0}<span class="muted" title="no face found">∅</span>{/if}
+										{#if r && 'error' in r}<span class="reject" title={r.error}>!</span>{/if}
+										{#if reframing === s.file}<span class="spin" title="finding crops"></span>{/if}
+									</span>
+								</span>
+							</button>
+						{/each}
+					</nav>
+				{/if}
+				<main>
+					{#key shot.file}
+						<Reframe
+							bind:this={reframer}
+							{shot}
+							data={reframeData && 'faces' in reframeData ? reframeData : undefined}
+							error={reframeData && 'error' in reframeData ? reframeData.error : null}
+							minLong={view.minLong}
+							onkeep={(list) => keepCrops(cur, list)}
+							onnext={() => stepPick(1)}
+							onprev={() => stepPick(-1)}
+						/>
+					{/key}
+				</main>
+			{:else}
 			{#if !fullscreen}
 				<nav class="groups" aria-label="groups">
 					{#each visibleGroups as gi (gi)}
@@ -542,15 +681,25 @@
 					/>
 				{/if}
 			</main>
+			{/if}
 		</div>
-		{#if !fullscreen}
+		{#if !fullscreen && stage === 'reframe'}
+			<footer>
+				{#if shot}<span class="now"><Badge {shot} /> {shot.file}</span>{/if}
+				<span class="keys">
+					<kbd>←→</kbd> pick <kbd>↑↓</kbd> suggestion <kbd>Enter</kbd> keep <kbd>⇧Enter</kbd> keep+next
+					<kbd>A</kbd> ratio <kbd>O</kbd> orient <kbd>−</kbd>/<kbd>=</kbd> size <kbd>Ctrl+arrows</kbd> nudge
+					<kbd>Z</kbd> result <kbd>Del</kbd> remove <kbd>2</kbd> pick <kbd>X</kbd>/<kbd>Esc</kbd> cull
+				</span>
+			</footer>
+		{:else if !fullscreen}
 			<footer>
 				{#if shot}<span class="now"><Badge {shot} /> {shot.file}</span>{/if}
 				<span class="keys">
 					<kbd>←→</kbd> frame <kbd>↑↓</kbd> group <kbd>2</kbd> pick <kbd>R</kbd> reject
 					<kbd>⇧2</kbd>/<kbd>⇧R</kbd> group <kbd>U</kbd> clear <kbd>Enter</kbd> accept group
 					<kbd>F</kbd> full <kbd>⇧F</kbd> fullscreen <kbd>M</kbd> mark <kbd>C</kbd> compare <kbd>E</kbd> eyes {eyesMode ? 'on' : 'off'}
-					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join
+					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join <kbd>X</kbd> reframe
 				</span>
 			</footer>
 		{/if}
@@ -737,6 +886,25 @@
 	}
 	.group.done {
 		opacity: 0.6;
+	}
+	.group.unpicked .pname {
+		text-decoration: line-through;
+		color: var(--muted);
+	}
+	.spin {
+		display: inline-block;
+		width: 0.65rem;
+		height: 0.65rem;
+		border: 2px solid var(--muted);
+		border-top-color: transparent;
+		border-radius: 50%;
+		animation: spin 0.8s linear infinite;
+		align-self: center;
+	}
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 	.group img {
 		width: 4.5rem;

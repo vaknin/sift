@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::Cache;
 use crate::cull::Mark;
 use crate::export::Sent;
+use crate::reframe::KeptCrop;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
@@ -28,6 +29,9 @@ pub struct Session {
     /// What Send changed in darktable, per file, so a re-send can undo removed marks.
     #[serde(default)]
     pub sent: BTreeMap<String, Sent>,
+    /// Crops kept in Reframe, per file.
+    #[serde(default)]
+    pub crops: BTreeMap<String, Vec<KeptCrop>>,
 }
 
 impl Session {
@@ -79,5 +83,12 @@ mod tests {
     fn loads_sessions_that_still_have_stars() {
         let s: Session = serde_json::from_str(r#"{"decisions":{"a":{"mark":"pick","stars":3}}}"#).unwrap();
         assert_eq!(s.decisions["a"], Decision { mark: Mark::Pick });
+    }
+
+    #[test]
+    fn loads_sessions_from_before_crops() {
+        let s: Session = serde_json::from_str(r#"{"decisions":{"a":{"mark":"pick"}},"splits":[],"joins":[],"sent":{}}"#).unwrap();
+        assert!(s.crops.is_empty());
+        assert_eq!(s.decisions.len(), 1);
     }
 }
