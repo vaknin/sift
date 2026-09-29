@@ -8,6 +8,7 @@
 		data,
 		error,
 		minLong,
+		cropOnly = $bindable(false),
 		onkeep,
 		onnext,
 		onprev
@@ -19,6 +20,8 @@
 		error: string | null;
 		/** Smallest long side a crop may have, full-resolution pixels. */
 		minLong: number;
+		/** Show only the crop, with nothing drawn over it; kept from frame to frame. */
+		cropOnly?: boolean;
 		/** Store the frame's kept crops; false when saving failed. */
 		onkeep: (crops: [Crop, Ratio][]) => Promise<boolean>;
 		onnext: () => void;
@@ -48,7 +51,8 @@
 	const W = $derived(data?.width ?? shot.width);
 	const H = $derived(data?.height ?? shot.height);
 	const crops = $derived(shot.crops);
-	const suggestions = $derived(data?.suggestions ?? []);
+	// The frame as shot is left out: hold Space to see it.
+	const suggestions = $derived((data?.suggestions ?? []).filter((s) => !s.notes.includes('original')));
 	const face = $derived(data?.faces[0]);
 
 	const full = (): Box => ({ crop: { x: 0, y: 0, w: 1, h: 1 }, ratio: simplest(shot.width, shot.height) });
@@ -57,8 +61,8 @@
 	let sel = $state<Card | null>(null);
 	/** The box after a manual change, and the card it started from. */
 	let edited = $state<(Box & { from: Card | null }) | null>(null);
-	/** The crop filling the pane. */
-	let result = $state(false);
+	/** Space held: the frame as shot, with nothing drawn over it. */
+	let original = $state(false);
 	let flash = $state<string | null>(null);
 	let flashTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -76,16 +80,20 @@
 
 	// Start on the first kept crop, else the best suggestion, once they are known.
 	$effect(() => {
-		if (sel !== null || !data) return;
+		if (sel !== null || (!data && !error)) return;
 		if (crops.length) load({ kind: 'kept', i: 0 });
 		else if (suggestions.length) load({ kind: 'suggestion', i: 0 });
 	});
 
-	const cards = $derived<Card[]>([
-		...(edited ? [{ kind: 'edited' } as const] : []),
-		...crops.map((_, i) => ({ kind: 'kept', i }) as const),
-		...suggestions.map((_, i) => ({ kind: 'suggestion', i }) as const)
-	]);
+	/** Left to right: kept crops, then suggestions; an edit sits just after the card it came from. */
+	const cards = $derived.by<Card[]>(() => {
+		const list: Card[] = [
+			...crops.map((_, i) => ({ kind: 'kept', i }) as const),
+			...suggestions.map((_, i) => ({ kind: 'suggestion', i }) as const)
+		];
+		if (edited) list.splice(list.findIndex((c) => same(c, edited!.from)) + 1, 0, { kind: 'edited' });
+		return list;
+	});
 	const same = (a: Card | null, b: Card | null) =>
 		a !== null && b !== null && a.kind === b.kind && (a.kind === 'edited' || a.i === (b as { i: number }).i);
 	function boxOf(c: Card): Box | undefined {
@@ -220,6 +228,8 @@
 	const px = $derived([Math.round(box.crop.w * W), Math.round(box.crop.h * H)]);
 	const long = $derived(longSide(box.crop, W, H));
 	const atWall = $derived(box.crop.w * W <= minW(box.ratio) + 0.5);
+	/** Why the selected suggestion was made. */
+	const notes = $derived(sel?.kind === 'suggestion' ? (suggestions[sel.i]?.notes ?? []) : []);
 	const mp = (c: Crop) => ((c.w * W * c.h * H) / 1e6).toFixed(1);
 
 	/** IoU of two crops. */
@@ -229,12 +239,11 @@
 		const i = iw * ih;
 		return i / (a.w * a.h + b.w * b.h - i);
 	}
-	const isOriginal = (c: Card | null) => c?.kind === 'suggestion' && suggestions[c.i]?.notes.includes('original');
 
 	/** Keep the box, or put it in place of the kept crop it was edited from. */
 	async function keep(): Promise<void> {
 		if (sel?.kind === 'kept') return say('already kept');
-		if (isOriginal(sel) || (box.crop.w > 0.999 && box.crop.h > 0.999)) return say('the original is always kept');
+		if (box.crop.w > 0.999 && box.crop.h > 0.999) return say('the original is always kept');
 		const replace = sel?.kind === 'edited' && edited?.from?.kind === 'kept' ? edited.from.i : -1;
 		const dup = crops.findIndex((k, i) => i !== replace && iou(k.crop, box.crop) > 0.95);
 		if (dup >= 0) {
@@ -251,16 +260,24 @@
 		say(replace >= 0 ? 'crop replaced' : `kept ✂${list.length}`);
 	}
 
-	/** Remove the selected kept crop; it stays in the box as an edit, so Enter brings it back. */
+	/** Remove the selected kept crop, or the one the box shows (a suggestion that was kept);
+	 * it stays in the box as an edit, so Enter brings it back. */
 	async function remove() {
-		const i = sel?.kind === 'kept' ? sel.i : sel?.kind === 'edited' && edited?.from?.kind === 'kept' ? edited.from.i : -1;
-		const k = crops[i];
-		if (!k) return;
+		let i = sel?.kind === 'kept' ? sel.i : sel?.kind === 'edited' && edited?.from?.kind === 'kept' ? edited.from.i : -1;
+		if (i < 0) i = crops.findIndex((k) => iou(k.crop, box.crop) > 0.95);
+		if (!crops[i]) return say(crops.length ? 'not kept · ← to a kept crop, then Del' : 'no kept crops to remove');
 		const list: [Crop, Ratio][] = crops.filter((_, j) => j !== i).map((c) => [c.crop, c.ratio]);
 		if (!(await onkeep(list))) return;
 		edited = { crop: { ...box.crop }, ratio: box.ratio, from: null };
 		sel = { kind: 'edited' };
 		say('removed · Enter keeps it again');
+	}
+
+	/** Key releases from the page; true when handled. */
+	export function handleKeyUp(e: KeyboardEvent): boolean {
+		if (e.code !== 'Space') return false;
+		original = false;
+		return true;
 	}
 
 	/** Keys from the page; true when handled. */
@@ -275,17 +292,18 @@
 			return true;
 		}
 		if (e.ctrlKey || e.altKey || e.metaKey) return false;
-		if (k === 'ArrowLeft') onprev();
-		else if (k === 'ArrowRight') onnext();
-		else if (k === 'ArrowUp') stepCard(-1);
-		else if (k === 'ArrowDown') stepCard(1);
+		if (k === 'ArrowUp') onprev();
+		else if (k === 'ArrowDown') onnext();
+		else if (k === 'ArrowLeft') stepCard(-1);
+		else if (k === 'ArrowRight') stepCard(1);
 		else if (k === 'Enter') e.shiftKey ? keep().then(onnext) : keep();
 		else if (e.code === 'KeyA') cycleRatio();
 		else if (e.code === 'KeyO') reshape([box.ratio[1], box.ratio[0]]);
 		else if (e.code === 'Minus') scale(0.95);
 		else if (e.code === 'Equal') scale(1.05);
-		else if (e.code === 'KeyZ') result = !result;
-		else if (k === 'Escape' && result) result = false;
+		else if (e.code === 'KeyZ') cropOnly = !cropOnly;
+		else if (e.code === 'Space') original = true;
+		else if (k === 'Escape' && cropOnly) cropOnly = false;
 		else if (k === 'Delete' || k === 'Backspace') remove();
 		else return false;
 		return true;
@@ -299,7 +317,7 @@
 		return [((e.clientX - r.left) / r.width) * W, ((e.clientY - r.top) / r.height) * H];
 	}
 	function startDrag(e: PointerEvent, hx: number, hy: number) {
-		if (e.button !== 0 || result) return;
+		if (e.button !== 0 || cropOnly) return;
 		e.stopPropagation();
 		const [x, y] = framePoint(e);
 		drag = { hx, hy, x, y, orig: { ...box.crop } };
@@ -334,14 +352,14 @@
 		edit(place(x + w / 2, y + h / 2, w, r));
 	}
 	function onwheel(e: WheelEvent) {
-		if (result) return;
+		if (cropOnly) return;
 		e.preventDefault();
 		scale(Math.exp(-e.deltaY * 0.0015));
 	}
 
 	/** Where the pane shows `v` (a frame fraction) as large as fits: sizes in CSS px. */
 	const view = $derived.by(() => {
-		const v = result ? box.crop : { x: 0, y: 0, w: 1, h: 1 };
+		const v = cropOnly && !original ? box.crop : { x: 0, y: 0, w: 1, h: 1 };
 		const k = cw && ch ? Math.min(cw / (v.w * W), ch / (v.h * H)) : 0;
 		return { w: v.w * W * k, h: v.h * H * k, iw: W * k, ih: H * k, ix: -v.x * W * k, iy: -v.y * H * k };
 	});
@@ -358,7 +376,7 @@
 	] as const;
 
 	/** A card's thumbnail: the display image cropped by CSS to a fixed height. */
-	const THUMB_H = 84;
+	const THUMB_H = 64;
 	function thumb(c: Crop) {
 		const h = THUMB_H;
 		const w = (h * (c.w * W)) / (c.h * H);
@@ -368,15 +386,17 @@
 		c.kind === 'edited'
 			? 'edited'
 			: c.kind === 'kept'
-				? `kept ${c.i + 1}`
-				: c.i === 0 && !isOriginal(c)
+				? `${c.i + 1}`
+				: c.i === 0
 					? 'best'
 					: '';
 	$effect(() => {
 		const k = cards.findIndex((c) => same(c, sel));
-		if (k >= 0) document.getElementById(`card-${k}`)?.scrollIntoView({ block: 'nearest' });
+		if (k >= 0) document.getElementById(`card-${k}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 	});
 </script>
+
+<svelte:window onblur={() => (original = false)} />
 
 <div class="reframe">
 	<div
@@ -398,7 +418,7 @@
 				draggable="false"
 				style="width:{view.iw}px;height:{view.ih}px;left:{view.ix}px;top:{view.iy}px"
 			/>
-			{#if !result}
+			{#if !cropOnly && !original}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div class="box" class:glide={!drag} style={pct(box.crop)} onpointerdown={(e) => startDrag(e, 0, 0)}>
 					<div class="line h" class:hot={hot.h === 1} style="top:33.333%"></div>
@@ -429,19 +449,20 @@
 				{/each}
 			{/if}
 		</div>
-		<div class="readout">
+		{#if original}<div class="asshot">as shot</div>{/if}
+		<div class="readout" class:gone={cropOnly || original}>
 			<span class="pill" class:warn={long < minLong * 1.2} class:hd={long >= FULL_HD}>
 				{ratioText(box.ratio)} · {px[0]}×{px[1]} · {mp(box.crop)} MP · {Math.round(box.crop.w * box.crop.h * 100)}% of frame
 				{#if atWall && box.crop.w < 1 && box.crop.h < 1}<b>min</b>{/if}
 				{#if long >= FULL_HD}<b>full HD</b>{/if}
 			</span>
+			{#each notes as n (n)}<span class="pill note">{noteText(n)}</span>{/each}
 			{#each warnings as w (w)}<span class="pill bad">{w}</span>{/each}
-			{#if result}<span class="pill">result · <kbd>Z</kbd> back</span>{/if}
 		</div>
 		{#if flash}<div class="flash">{flash}</div>{/if}
 	</div>
 
-	<aside class="cards" aria-label="crops">
+	<div class="strip" aria-label="crops">
 		{#if error}
 			<p class="msg bad">Couldn't make suggestions: {error}</p>
 		{:else if !data}
@@ -451,44 +472,44 @@
 		{/if}
 		{#each cards as c, k (c.kind === 'edited' ? 'e' : `${c.kind}${c.i}`)}
 			{@const b = boxOf(c)}
-			{@const s = c.kind === 'suggestion' ? suggestions[c.i] : undefined}
 			{#if b}
-				{#if (c.kind === 'kept' && c.i === 0) || (c.kind === 'suggestion' && c.i === 0)}
-					<h4>{c.kind === 'kept' ? 'Kept' : 'Suggestions'}</h4>
+				{#if c.kind !== 'edited' && c.i === 0}
+					<span class="set">{c.kind === 'kept' ? 'kept' : 'suggested'}</span>
 				{/if}
 				{@const t = thumb(b.crop)}
-				<button id="card-{k}" class="card" class:on={same(c, sel)} class:kept={c.kind === 'kept'} onclick={() => load(c)}>
+				{@const label = cardLabel(c)}
+				<button
+					id="card-{k}"
+					class="card"
+					class:on={same(c, sel)}
+					class:kept={c.kind === 'kept'}
+					class:edited={c.kind === 'edited'}
+					onclick={() => load(c)}
+					title="{mp(b.crop)} MP"
+				>
 					<span class="thumb" style="width:{t.w}px;height:{THUMB_H}px">
 						<img src={src(shot.display)} alt="" draggable="false" style={t.img} />
+						{#if label}<span class="tag" class:best={label === 'best'}>{label}</span>{/if}
 					</span>
-					<span class="meta">
-						<span class="top">
-							{#if cardLabel(c)}<span class="tag" class:best={cardLabel(c) === 'best'}>{cardLabel(c)}</span>{/if}
-							<b>{ratioText(b.ratio)}</b>
-						</span>
-						<span class="muted">{mp(b.crop)} MP · {longSide(b.crop, W, H)} px</span>
-						{#if s}
-							<span class="notes">
-								{#each s.notes as n (n)}<span class="note" class:orig={n === 'original'}>{noteText(n)}</span>{/each}
-							</span>
-						{/if}
-					</span>
+					<span class="meta"><b>{ratioText(b.ratio)}</b> {longSide(b.crop, W, H)} px</span>
 				</button>
 			{/if}
 		{/each}
-	</aside>
+	</div>
 </div>
 
 <style>
 	.reframe {
 		flex: 1;
 		display: flex;
+		flex-direction: column;
 		min-height: 0;
 	}
 	.pane {
 		position: relative;
 		flex: 1;
 		min-width: 0;
+		min-height: 0;
 		overflow: hidden;
 		background: #000;
 		display: grid;
@@ -579,6 +600,19 @@
 		flex-wrap: wrap;
 		pointer-events: none;
 	}
+	.readout.gone {
+		display: none;
+	}
+	.asshot {
+		position: absolute;
+		top: 0.6rem;
+		left: 0.7rem;
+		font-size: 0.75rem;
+		color: #ddd;
+		opacity: 0.7;
+		text-shadow: 0 0 3px #000;
+		pointer-events: none;
+	}
 	.pill {
 		font-size: 0.8rem;
 		padding: 0.15rem 0.6rem;
@@ -613,25 +647,36 @@
 		border: 1px solid var(--accent);
 		pointer-events: none;
 	}
-	.cards {
-		width: 19rem;
-		flex: none;
-		overflow-y: auto;
-		border-left: 1px solid var(--line);
-		padding: 0.4rem;
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
+	.pill.note {
+		color: var(--muted);
 	}
-	h4 {
-		margin: 0.5rem 0.2rem 0.1rem;
-		font-size: 0.7rem;
+	/* Crops left to right, like the filmstrip in Cull: ←→ walk it. */
+	.strip {
+		flex: none;
+		display: flex;
+		align-items: flex-end;
+		gap: 4px;
+		overflow-x: auto;
+		padding: 4px 0.5rem;
+		background: #0b0b0c;
+		border-top: 1px solid var(--line);
+		min-height: 5.4rem;
+		box-sizing: border-box;
+	}
+	.set {
+		align-self: stretch;
+		writing-mode: vertical-rl;
+		transform: rotate(180deg);
+		text-align: center;
+		font-size: 0.62rem;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
 		color: var(--muted);
+		margin-left: 0.3rem;
 	}
 	.msg {
-		margin: 0.3rem;
+		align-self: center;
+		margin: 0 0.5rem;
 		font-size: 0.8rem;
 		color: var(--muted);
 	}
@@ -639,21 +684,26 @@
 		color: #ffb4ad;
 	}
 	.card {
+		flex: none;
 		display: flex;
-		gap: 0.6rem;
+		flex-direction: column;
 		align-items: center;
-		text-align: left;
-		padding: 0.3rem;
+		gap: 2px;
+		padding: 2px;
 		background: transparent;
 		border: 2px solid transparent;
-		flex: none;
+		border-radius: 4px;
+		opacity: 0.7;
 	}
 	.card.on {
 		border-color: var(--accent);
-		background: var(--panel-hi);
+		opacity: 1;
 	}
 	.card.kept .thumb {
 		outline: 1px solid var(--pick);
+	}
+	.card.edited .thumb {
+		outline: 1px dashed var(--accent);
 	}
 	.thumb {
 		position: relative;
@@ -666,46 +716,32 @@
 		position: absolute;
 		max-width: none;
 	}
-	.meta {
-		display: flex;
-		flex-direction: column;
-		gap: 0.15rem;
-		font-size: 0.78rem;
-		min-width: 0;
-	}
-	.top {
-		display: flex;
-		gap: 0.4rem;
-		align-items: center;
-	}
 	.tag {
-		font-size: 0.65rem;
-		padding: 0 0.35rem;
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		font-size: 0.6rem;
+		font-weight: 700;
+		padding: 0 0.3rem;
 		border-radius: 3px;
-		background: var(--chip);
+		background: rgba(20, 21, 24, 0.85);
 		text-transform: uppercase;
+	}
+	.card.kept .tag {
+		color: var(--pick);
 	}
 	.tag.best {
 		background: var(--accent);
 		color: #111;
 	}
-	.notes {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.2rem;
-	}
-	.note {
-		font-size: 0.66rem;
-		padding: 0 0.35rem;
-		border-radius: 99px;
-		background: var(--chip);
+	.meta {
+		font-size: 0.68rem;
 		color: var(--muted);
+		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
 	}
-	.note.orig {
+	.meta b {
 		color: var(--text);
-	}
-	.muted {
-		color: var(--muted);
 	}
 	.spin {
 		display: inline-block;

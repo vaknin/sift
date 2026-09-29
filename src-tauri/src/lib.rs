@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 use sift_engine::cull::{self, Config, EyeState, Verdict};
 use sift_engine::export::{self, Darktable, Report};
+use sift_engine::people::{self, Library, Person};
 use sift_engine::preview;
 use sift_engine::reframe::{self, Crop, KeptCrop, Ratio, ReframeConfig, Scene, Suggestion};
 use sift_engine::session::{Decision, Session};
@@ -18,6 +19,9 @@ struct Open {
     shots: Vec<ShotAnalysis>,
     auto: Vec<Vec<usize>>,
     session: Session,
+    /// Named people, shared by every folder.
+    library: Library,
+    people: Vec<Person>,
 }
 
 #[derive(Default)]
@@ -36,6 +40,8 @@ struct FaceView {
     presence: f32,
     smile: f32,
     face_luma: f32,
+    /// Id of the person this face belongs to, see `View::people`.
+    person: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +72,20 @@ struct View {
     groups: Vec<Vec<usize>>,
     /// Smallest long side a Reframe crop may have, in full-resolution pixels.
     min_long: u32,
+    /// People found in the folder, named first, then by photo count.
+    people: Vec<PersonView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonView {
+    id: u32,
+    /// None until the user names them; the UI shows "Person N".
+    name: Option<String>,
+    /// Photos they are in.
+    photos: usize,
+    /// Their clearest face, aligned (112 px square).
+    face: PathBuf,
 }
 
 /// A face as Reframe draws and snaps to it, normalised to the upright frame.
@@ -121,13 +141,24 @@ impl Open {
         (groups, verdicts)
     }
 
+    fn regroup_people(&mut self) {
+        self.people = people::people(&self.shots, &self.library, &self.session.people, people::SAME);
+    }
+
     fn view(&self) -> View {
         let (groups, verdicts) = self.judged();
+        let mut person_of = std::collections::HashMap::new();
+        for p in &self.people {
+            for &f in &p.faces {
+                person_of.insert(f, p.id);
+            }
+        }
         let shots = self
             .shots
             .iter()
             .zip(verdicts)
-            .map(|(s, verdict)| ShotView {
+            .enumerate()
+            .map(|(si, (s, verdict))| ShotView {
                 file: s.file.clone(),
                 time: s.time,
                 width: s.width,
@@ -141,19 +172,40 @@ impl Open {
                 faces: s
                     .faces
                     .iter()
-                    .map(|f| FaceView {
+                    .enumerate()
+                    .map(|(fi, f)| FaceView {
                         blink: f.blink,
                         eyes: f.blink.map(|b| cull::eye_state(b, &Config::default())),
                         eye_sharp: f.eye_sharp,
                         presence: f.presence,
                         smile: f.smile,
                         face_luma: f.face_luma,
+                        person: person_of.get(&(si, fi)).copied(),
                     })
                     .collect(),
                 crops: self.session.crops.get(&s.file).cloned().unwrap_or_default(),
             })
             .collect();
-        View { folder: self.cache.folder.clone(), shots, groups, min_long: ReframeConfig::default().min_long }
+        let people = self
+            .people
+            .iter()
+            .map(|p| {
+                let mut photos: Vec<usize> = p.faces.iter().map(|f| f.0).collect();
+                photos.dedup();
+                let &(s, f) = p
+                    .faces
+                    .iter()
+                    .max_by(|a, b| self.shots[a.0].faces[a.1].embed_norm.total_cmp(&self.shots[b.0].faces[b.1].embed_norm))
+                    .expect("people have faces");
+                PersonView {
+                    id: p.id,
+                    name: p.name.clone(),
+                    photos: photos.len(),
+                    face: self.cache.img(&cache::face_name(&self.shots[s], f)),
+                }
+            })
+            .collect();
+        View { folder: self.cache.folder.clone(), shots, groups, min_long: ReframeConfig::default().min_long, people }
     }
 }
 
@@ -227,7 +279,8 @@ async fn open_folder(app: AppHandle, path: PathBuf) -> Result<View, String> {
         let (cache, shots) = analyze_folder(&path, models, &on_shot).map_err(|e| format!("{e:#}"))?;
         let auto = cull::group(&shots, &Config::default());
         let session = Session::load(&cache);
-        let open = Open { cache, shots, auto, session };
+        let mut open = Open { cache, shots, auto, session, library: Library::load(), people: vec![] };
+        open.regroup_people();
         let view = open.view();
         *state.open.lock().unwrap() = Some(open);
         Ok(view)
@@ -269,6 +322,36 @@ fn regroup(state: State<'_, AppState>, file: String, split: bool) -> Result<View
             s.joins.insert(file);
         }
         o.session.save(&o.cache)?;
+        Ok(o.view())
+    })
+}
+
+/// Name person `id` (a folder's "Person N", or rename a named one). Named
+/// people are remembered for every folder; taking an existing name merges
+/// into that person, and an empty name forgets a named person.
+#[tauri::command]
+fn name_person(state: State<'_, AppState>, id: u32, name: String) -> Result<View, String> {
+    with_open(&state, |o| {
+        let p = o.people.iter().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no person {id}"))?;
+        if o.library.people.iter().any(|k| k.id == id) {
+            o.library.rename(id, &name);
+        } else if !name.trim().is_empty() {
+            let embeds: Vec<&[f32]> = p.faces.iter().map(|&(s, f)| o.shots[s].faces[f].embed.as_slice()).collect();
+            o.library.learn(&name, &embeds);
+        }
+        o.library.save()?;
+        o.regroup_people();
+        Ok(o.view())
+    })
+}
+
+/// Take one face out of its person (`person` 0) or give it to a named person.
+#[tauri::command]
+fn assign_face(state: State<'_, AppState>, file: String, face: usize, person: u32) -> Result<View, String> {
+    with_open(&state, |o| {
+        o.session.people.insert(format!("{file}:{face}"), person);
+        o.session.save(&o.cache)?;
+        o.regroup_people();
         Ok(o.view())
     })
 }
@@ -364,6 +447,8 @@ pub fn run() {
             regroup,
             reframe,
             set_crops,
+            name_person,
+            assign_face,
             send_to_darktable,
             darktable_status
         ])

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sift_engine::calibrate::{self, Agreement, Shoot};
 use sift_engine::cull::{self, Config, Mark};
+use sift_engine::people::{self, Library};
 use sift_engine::export::{self, Darktable};
 use sift_engine::preview;
 use sift_engine::reframe::{self, ReframeConfig, Scene};
@@ -39,6 +40,16 @@ enum Cmd {
         #[arg(required = true)]
         dirs: Vec<PathBuf>,
     },
+    /// Group the folder's faces into people and print who is in which photos.
+    People {
+        dir: PathBuf,
+        /// Cosine similarity for "same person".
+        #[arg(long, default_value_t = people::SAME)]
+        threshold: f32,
+        /// Write a contact sheet here: one row of face crops per person.
+        #[arg(long)]
+        sheet: Option<PathBuf>,
+    },
     /// Suggest crops for one frame.
     Reframe {
         file: PathBuf,
@@ -53,6 +64,7 @@ fn main() -> Result<()> {
         Cmd::Analyze { dir, json } => run_analyze(&dir, json),
         Cmd::Export { dir, dry_run } => run_export(&dir, dry_run),
         Cmd::Calibrate { dirs } => run_calibrate(&dirs),
+        Cmd::People { dir, threshold, sheet } => run_people(&dir, threshold, sheet.as_deref()),
         Cmd::Reframe { file, out } => run_reframe(&file, out.as_deref()),
     }
 }
@@ -90,6 +102,49 @@ fn run_analyze(dir: &Path, json: bool) -> Result<()> {
         }
     }
     println!("{} groups · {picks} picks · {rejects} rejects · {} photos", groups.len(), shots.len());
+    Ok(())
+}
+
+fn run_people(dir: &Path, thr: f32, sheet: Option<&Path>) -> Result<()> {
+    let t0 = Instant::now();
+    let models = Models::new()?;
+    let (cache, shots) = analyze_folder(dir, &models, &|done, total, _| {
+        if done % 10 == 0 || done == total {
+            eprint!("\r{done}/{total}");
+        }
+    })?;
+    eprintln!("\ranalysed {} photos in {:.1?}", shots.len(), t0.elapsed());
+    let session = Session::load(&cache);
+    let found = people::people(&shots, &Library::load(), &session.people, thr);
+    let faces: usize = shots.iter().map(|s| s.faces.iter().filter(|f| !f.embed.is_empty()).count()).sum();
+    let grouped: usize = found.iter().map(|p| p.faces.len()).sum();
+    for (n, p) in found.iter().enumerate() {
+        let name = p.name.clone().unwrap_or_else(|| format!("Person {}", n + 1));
+        let files: Vec<&str> = p.faces.iter().map(|&(s, _)| shots[s].file.as_str()).collect();
+        println!("{name} ({} faces): {}", p.faces.len(), files.join(" "));
+    }
+    println!("{} people · {grouped} of {faces} identifiable faces grouped · threshold {thr}", found.len());
+
+    if let Some(out) = sheet {
+        const PX: u32 = 112;
+        const COLS: u32 = 16;
+        let rows: Vec<Vec<PathBuf>> = found
+            .iter()
+            .map(|p| {
+                p.faces.iter().take(COLS as usize).map(|&(s, i)| cache.img(&sift_engine::cache::face_name(&shots[s], i))).collect()
+            })
+            .collect();
+        let mut img = image::RgbImage::from_pixel(COLS * PX, rows.len().max(1) as u32 * PX, image::Rgb([32, 32, 32]));
+        for (r, row) in rows.iter().enumerate() {
+            for (c, path) in row.iter().enumerate() {
+                if let Ok(face) = image::open(path) {
+                    image::imageops::overlay(&mut img, &face.to_rgb8(), c as i64 * PX as i64, r as i64 * PX as i64);
+                }
+            }
+        }
+        img.save(out)?;
+        eprintln!("sheet: {}", out.display());
+    }
     Ok(())
 }
 

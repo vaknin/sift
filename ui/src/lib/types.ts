@@ -35,6 +35,8 @@ export interface Face {
 	presence: number;
 	smile: number;
 	faceLuma: number;
+	/** Id of the person this face belongs to (`View.people`). */
+	person: number | null;
 }
 
 export interface Shot {
@@ -59,6 +61,18 @@ export interface View {
 	groups: number[][];
 	/** Smallest long side a Reframe crop may have, full-resolution pixels. */
 	minLong: number;
+	/** People in the folder, named first, then by photo count. */
+	people: Person[];
+}
+
+export interface Person {
+	id: number;
+	/** Null until named; shown as "Person N". */
+	name: string | null;
+	/** Photos they are in. */
+	photos: number;
+	/** Their clearest face, aligned square crop. */
+	face: string;
 }
 
 export interface Progress {

@@ -14,6 +14,12 @@ export const reframe = (file: string) => invoke<ReframeView>('reframe', { file }
 /** Replace a frame's kept crops; returns them with their ids. */
 export const setCrops = (file: string, crops: [Crop, Ratio][]) => invoke<KeptCrop[]>('set_crops', { file, crops });
 
+/** Name a person (remembered in every folder); an existing name merges, empty forgets. */
+export const namePerson = (id: number, name: string) => invoke<View>('name_person', { id, name });
+/** Take a face out of its person (0) or give it to a named person. */
+export const assignFace = (file: string, face: number, person: number) =>
+	invoke<View>('assign_face', { file, face, person });
+
 export const src = (path: string) => convertFileSrc(path);
 
 /** The user's decision when there is one, else the pre-mark. */

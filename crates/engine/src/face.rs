@@ -1,5 +1,6 @@
 //! Face detection (YuNet), the MediaPipe face mesh (478 landmarks) and
-//! MediaPipe blendshapes (eye blink, smile, ...), all run through tract.
+//! MediaPipe blendshapes (eye blink, smile, ...) and SFace identity
+//! embeddings, all run through tract.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,7 @@ use tract_onnx::prelude::*;
 static YUNET: &[u8] = include_bytes!("../../../models/face_detection_yunet.dyn.onnx");
 static MESH: &[u8] = include_bytes!("../../../models/face_landmarks.onnx");
 static BLEND: &[u8] = include_bytes!("../../../models/face_blendshapes.sim.onnx");
+static SFACE: &[u8] = include_bytes!("../../../models/face_recognition_sface_2021dec.onnx");
 
 type Plan = Arc<TypedRunnableModel>;
 
@@ -19,6 +21,13 @@ type Plan = Arc<TypedRunnableModel>;
 /// full-body face at ~40 px; frames with no face get a second look at 1280.
 const DETECT_LONG: [u32; 2] = [640, 1280];
 const MESH_SIZE: usize = 256;
+/// SFace's aligned input side and embedding length.
+pub const ALIGN_SIZE: usize = 112;
+pub const EMBED_LEN: usize = 128;
+/// Where the five YuNet landmarks land in the aligned 112² crop (the
+/// ArcFace template OpenCV's `alignCrop` uses). Image-left eye first, as YuNet.
+const TEMPLATE: [[f32; 2]; 5] =
+    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Detection {
@@ -43,6 +52,7 @@ pub struct Models {
     yunet_plans: Mutex<HashMap<(usize, usize), Plan>>,
     mesh: Plan,
     blend: Plan,
+    sface: Plan,
 }
 
 fn load(bytes: &[u8], shape: &[usize]) -> Result<Plan> {
@@ -60,6 +70,7 @@ impl Models {
             yunet_plans: Mutex::default(),
             mesh: load(MESH, &[1, MESH_SIZE, MESH_SIZE, 3])?,
             blend: load(BLEND, &[1, 146, 2])?,
+            sface: load(SFACE, &[1, 3, ALIGN_SIZE, ALIGN_SIZE])?,
         })
     }
 
@@ -164,6 +175,26 @@ impl Models {
         Ok(mesh)
     }
 
+    /// Identity embedding of one face (unit length; cosine similarity is a dot
+    /// product), its length before normalising (low for blurred, turned or
+    /// non-faces), and the aligned crop it was computed from.
+    pub fn embed(&self, img: &RgbImage, det: &Detection) -> Result<(Vec<f32>, f32, RgbImage)> {
+        let crop = align(img, &det.kps);
+        // RGB, 0..255, NCHW (OpenCV's FaceRecognizerSF swaps its BGR to RGB).
+        let mut input = tract_ndarray::Array4::<f32>::zeros((1, 3, ALIGN_SIZE, ALIGN_SIZE));
+        for (x, y, p) in crop.enumerate_pixels() {
+            for c in 0..3 {
+                input[[0, c, y as usize, x as usize]] = p[c] as f32;
+            }
+        }
+        let out = self.sface.run(tvec!(input.into_tensor().into()))?;
+        let mut v = f32s(&out[0])?.to_vec();
+        ensure!(v.len() == EMBED_LEN, "unexpected SFace output length {}", v.len());
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        v.iter_mut().for_each(|x| *x /= n);
+        Ok((v, n, crop))
+    }
+
     fn mesh_once(&self, img: &RgbImage, roi: &Roi) -> Result<Mesh> {
         let input = roi.warp(img);
         let t = tract_ndarray::Array4::from_shape_vec((1, MESH_SIZE, MESH_SIZE, 3), input)?;
@@ -251,6 +282,60 @@ impl Roi {
     }
 }
 
+/// Similarity transform (a, b, tx, ty) taking template points to image points
+/// in the least-squares sense: image = [a -b; b a] · template + t.
+fn similarity(from: &[[f32; 2]; 5], to: &[[f32; 2]; 5]) -> [f32; 4] {
+    let mean = |p: &[[f32; 2]; 5]| {
+        let (x, y) = p.iter().fold((0.0, 0.0), |(x, y), q| (x + q[0], y + q[1]));
+        [x / 5.0, y / 5.0]
+    };
+    let (mf, mt) = (mean(from), mean(to));
+    let (mut sa, mut sb, mut ss) = (0.0, 0.0, 0.0);
+    for (f, t) in from.iter().zip(to) {
+        let (x, y) = (f[0] - mf[0], f[1] - mf[1]);
+        let (u, v) = (t[0] - mt[0], t[1] - mt[1]);
+        sa += x * u + y * v;
+        sb += x * v - y * u;
+        ss += x * x + y * y;
+    }
+    let (a, b) = (sa / ss.max(1e-6), sb / ss.max(1e-6));
+    [a, b, mt[0] - (a * mf[0] - b * mf[1]), mt[1] - (b * mf[0] + a * mf[1])]
+}
+
+/// The face warped onto the SFace template, ALIGN_SIZE². Downscales the
+/// covering region first so a big face doesn't alias; outside the frame is black.
+fn align(img: &RgbImage, kps: &[[f32; 2]; 5]) -> RgbImage {
+    let [a, b, tx, ty] = similarity(&TEMPLATE, kps);
+    let map = |u: f32, v: f32| (a * u - b * v + tx, b * u + a * v + ty);
+    let n = ALIGN_SIZE as f32;
+    let corners = [map(0.0, 0.0), map(n, 0.0), map(0.0, n), map(n, n)];
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let fold = |f: fn(f32, f32) -> f32, init: f32, k: usize| {
+        corners.iter().map(|c| if k == 0 { c.0 } else { c.1 }).fold(init, f)
+    };
+    let x0 = (fold(f32::min, f32::MAX, 0) - 2.0).floor().clamp(0.0, iw - 1.0);
+    let y0 = (fold(f32::min, f32::MAX, 1) - 2.0).floor().clamp(0.0, ih - 1.0);
+    let x1 = (fold(f32::max, f32::MIN, 0) + 2.0).ceil().clamp(x0 + 1.0, iw);
+    let y1 = (fold(f32::max, f32::MIN, 1) + 2.0).ceil().clamp(y0 + 1.0, ih);
+    let scale = (a * a + b * b).sqrt().max(1e-6);
+    let f = (1.0 / scale).min(1.0);
+    let sw = ((x1 - x0) * f).round().max(1.0) as u32;
+    let sh = ((y1 - y0) * f).round().max(1.0) as u32;
+    let region = [x0 as f64, y0 as f64, (x1 - x0) as f64, (y1 - y0) as f64];
+    let sub = crate::resize::rgb(img, Some(region), sw, sh);
+    let f = sw as f32 / (x1 - x0);
+
+    let mut out = RgbImage::new(ALIGN_SIZE as u32, ALIGN_SIZE as u32);
+    for (u, v, px) in out.enumerate_pixels_mut() {
+        let (ix, iy) = map(u as f32 + 0.5, v as f32 + 0.5);
+        if let Some(c) = bilinear(&sub, (ix - x0) * f - 0.5, (iy - y0) * f - 0.5) {
+            *px = image::Rgb(c.map(|c| c.round().clamp(0.0, 255.0) as u8));
+        }
+    }
+    lift(out.as_mut());
+    out
+}
+
 /// Brighten low-key frames for the networks (they're trained on ordinary
 /// exposures): stretch so the 99.5th percentile sits at 235, then lift the
 /// midtones with a gamma until the median is near 100. Works on RGB triples
@@ -309,7 +394,7 @@ fn bilinear(img: &RgbImage, x: f32, y: f32) -> Option<[f32; 3]> {
     }))
 }
 
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+pub(crate) fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let (x0, y0) = (a[0].max(b[0]), a[1].max(b[1]));
     let (x1, y1) = ((a[0] + a[2]).min(b[0] + b[2]), (a[1] + a[3]).min(b[1] + b[3]));
     let inter = (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
@@ -357,4 +442,21 @@ pub fn blend(mesh: &Mesh, name: &str) -> f32 {
 
 fn f32s(t: &TValue) -> Result<&[f32]> {
     Ok(t.try_as_plain_ram()?.as_slice::<f32>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn similarity_recovers_scale_rotation_and_shift() {
+        let (a, b, tx, ty) = (1.5f32 * 0.8, 1.5f32 * 0.6, 40.0, -7.0);
+        let to = TEMPLATE.map(|[x, y]| [a * x - b * y + tx, b * x + a * y + ty]);
+        let got = similarity(&TEMPLATE, &to);
+        for (g, w) in got.iter().zip([a, b, tx, ty]) {
+            assert!((g - w).abs() < 1e-3, "{got:?}");
+        }
+        let id = similarity(&TEMPLATE, &TEMPLATE);
+        assert!((id[0] - 1.0).abs() < 1e-5 && id[1].abs() < 1e-5 && id[2].abs() < 1e-3 && id[3].abs() < 1e-3);
+    }
 }

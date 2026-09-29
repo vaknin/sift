@@ -4,6 +4,7 @@ pub mod cull;
 pub mod export;
 pub mod face;
 pub mod measure;
+pub mod people;
 pub mod preview;
 pub mod reframe;
 mod resize;
@@ -25,6 +26,8 @@ pub use preview::Shot;
 const MIN_FACE_SCORE: f32 = 0.6;
 /// Faces smaller than this fraction of the largest face are background people.
 const MIN_FACE_REL: f32 = 0.25;
+/// Faces narrower than this (full-res px) are too small to identify reliably.
+const MIN_EMBED_PX: f32 = 48.0;
 /// Long side of the display copy the UI shows.
 pub const DISPLAY_PX: u32 = 2048;
 pub const THUMB_PX: u32 = 400;
@@ -46,6 +49,10 @@ pub struct ShotAnalysis {
     /// SIG_PX² grey thumbnail, levels-normalised.
     pub sig: Vec<u8>,
     pub error: Option<String>,
+    /// The identity pass has run (faces carry `embed` where big enough).
+    /// False for shots cached before people existed; they get it on next open.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 impl ShotAnalysis {
@@ -66,6 +73,7 @@ impl ShotAnalysis {
             frame_sharp: 0.0,
             sig: vec![],
             error: Some(format!("{e:#}")),
+            embedded: false,
         }
     }
 }
@@ -80,9 +88,11 @@ pub fn analyze(models: &Models, shot: &Shot, cache: &Cache) -> Result<ShotAnalys
     let dets = models.detect(&img, MIN_FACE_SCORE)?;
     let biggest = dets.first().map(|d| d.bbox[2]).unwrap_or(0.0);
     let mut faces = vec![];
+    let mut kept = vec![];
     for d in dets.iter().filter(|d| d.bbox[2] >= biggest * MIN_FACE_REL) {
         let mesh = models.mesh(&img, d)?;
         faces.push(measure::measure(&img, d, &mesh));
+        kept.push(*d);
     }
     let (size, mtime) = cache::stamp(&shot.path);
     let a = ShotAnalysis {
@@ -96,9 +106,45 @@ pub fn analyze(models: &Models, shot: &Shot, cache: &Cache) -> Result<ShotAnalys
         sig: signature(&img),
         faces,
         error: None,
+        embedded: false,
     };
     write_images(&img, &a, cache)?;
+    let mut a = a;
+    embed_faces(models, &img, &kept, &mut a, cache)?;
     Ok(a)
+}
+
+/// Identity embeddings for the faces of `a`, which were measured from `dets`
+/// (same order); saves each identified face's aligned crop for the UI.
+fn embed_faces(models: &Models, img: &RgbImage, dets: &[face::Detection], a: &mut ShotAnalysis, cache: &Cache) -> Result<()> {
+    for (i, d) in dets.iter().enumerate() {
+        if d.bbox[2] < MIN_EMBED_PX {
+            continue;
+        }
+        let (v, norm, crop) = models.embed(img, d)?;
+        cache.save_jpeg(&crop, &cache::face_name(a, i), 88)?;
+        a.faces[i].embed = v;
+        a.faces[i].embed_norm = norm;
+    }
+    a.embedded = true;
+    Ok(())
+}
+
+/// The identity pass for a shot analysed before embeddings existed: detect
+/// again and pair each stored face with the detection that overlaps it most.
+fn backfill_embeddings(models: &Models, shot: &Shot, a: &mut ShotAnalysis, cache: &Cache) -> Result<()> {
+    let img = preview::load(shot)?;
+    let dets = models.detect(&img, MIN_FACE_SCORE)?;
+    let mut paired = vec![];
+    for f in &a.faces {
+        let best = dets.iter().max_by(|x, y| face::iou(&x.bbox, &f.bbox).total_cmp(&face::iou(&y.bbox, &f.bbox)));
+        match best {
+            Some(d) if face::iou(&d.bbox, &f.bbox) > 0.5 => paired.push(*d),
+            // No match: a zero-size stand-in that embed_faces skips.
+            _ => paired.push(face::Detection { bbox: [0.0; 4], score: 0.0, kps: [[0.0; 2]; 5] }),
+        }
+    }
+    embed_faces(models, &img, &paired, a, cache)
 }
 
 fn fit(img: &RgbImage, long: u32) -> RgbImage {
@@ -152,9 +198,23 @@ pub fn analyze_folder(
     let todo = preview::read_exif(&misses)?;
     let total = hits.len() + todo.len();
     let mut results: Vec<ShotAnalysis> = hits.iter().filter_map(|p| cached.remove(&file_name(p))).collect();
-    for (i, a) in results.iter().enumerate() {
+    // Shots cached before identities existed get only the identity pass.
+    let stale: Vec<_> = results
+        .iter()
+        .filter(|a| !a.embedded && !a.faces.is_empty())
+        .map(|a| cache.folder.join(&a.file))
+        .collect();
+    let stale: std::collections::HashMap<String, Shot> =
+        preview::read_exif(&stale)?.into_iter().map(|s| (file_name(&s.path), s)).collect();
+    for (i, a) in results.iter().filter(|a| !stale.contains_key(&a.file)).enumerate() {
         on_shot(i + 1, total, a);
     }
+    let done = AtomicUsize::new(results.len() - stale.len());
+    results.par_iter_mut().filter(|a| stale.contains_key(&a.file)).for_each(|a| {
+        // A failure leaves the shot unembedded; it is retried on the next open.
+        let _ = backfill_embeddings(models, &stale[&a.file], a, &cache);
+        on_shot(done.fetch_add(1, Ordering::Relaxed) + 1, total, a);
+    });
     let done = AtomicUsize::new(results.len());
     results.par_extend(todo.par_iter().map(|shot| {
         let a = analyze(models, shot, &cache).unwrap_or_else(|e| ShotAnalysis::failed(shot, &e));

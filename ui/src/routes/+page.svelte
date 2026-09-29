@@ -13,6 +13,7 @@
 	import Badge from '$lib/Badge.svelte';
 	import ZoomView, { fitZoom, type Zoom } from '$lib/ZoomView.svelte';
 	import Reframe from '$lib/Reframe.svelte';
+	import People from '$lib/People.svelte';
 
 	let view = $state<View | null>(null);
 	let progress = $state<Progress | null>(null);
@@ -20,6 +21,9 @@
 	let error = $state<string | null>(null);
 	let cur = $state(0);
 	let filter = $state<Filter>('all');
+	/** Show only frames with this person in them (`View.people` id). */
+	let person = $state<number | null>(null);
+	let peopleBar = $state<{ rename: (id: number) => void; label: (p: import('$lib/types').Person) => string }>();
 	let mode = $state<'grid' | 'full' | 'compare'>('grid');
 	let eyesMode = $state(false);
 	let boost = $state(true);
@@ -48,7 +52,9 @@
 	const reframes = new SvelteMap<string, ReframeView | { error: string }>();
 	/** The file whose suggestions are being made. */
 	let reframing = $state<string | null>(null);
-	let reframer = $state<{ handleKey: (e: KeyboardEvent) => boolean }>();
+	/** Reframe's Z view, the crop alone; stays on from pick to pick. */
+	let cropOnly = $state(false);
+	let reframer = $state<{ handleKey: (e: KeyboardEvent) => boolean; handleKeyUp: (e: KeyboardEvent) => boolean }>();
 	/** Bumped to stop a running prefetch loop. */
 	let prefetchGen = 0;
 
@@ -58,9 +64,18 @@
 		return out;
 	});
 	const tilesOf = (gi: number): number[] =>
-		(view?.groups[gi] ?? []).filter((i) => view !== null && matches(view.shots[i]!, filter));
+		(view?.groups[gi] ?? []).filter(
+			(i) =>
+				view !== null &&
+				matches(view.shots[i]!, filter) &&
+				(person === null || view.shots[i]!.faces.some((f) => f.person === person))
+		);
 	const visibleGroups = $derived(view ? view.groups.map((_, gi) => gi).filter((gi) => tilesOf(gi).length > 0) : []);
 	const flat = $derived(visibleGroups.flatMap(tilesOf));
+	// A person can vanish (forgotten, or their last face taken out).
+	$effect(() => {
+		if (person !== null && !view?.people.some((p) => p.id === person)) person = null;
+	});
 	const curGroup = $derived(groupOf[cur] ?? 0);
 	const shot = $derived(view?.shots[cur]);
 	const counts = $derived.by(() => {
@@ -128,6 +143,7 @@
 			if (e.payload.thumb) recent = [...recent.slice(-47), e.payload.thumb];
 		});
 		try {
+			person = null;
 			view = await api.openFolder(path);
 			const firstPending = view.shots.findIndex((s) => s.decision === null);
 			cur = Math.max(0, firstPending);
@@ -283,6 +299,36 @@
 		}
 	}
 
+	/** Name (or rename) a person; the filter follows them to their new id. */
+	async function namePerson(id: number, name: string) {
+		try {
+			const v = await api.namePerson(id, name);
+			const wasActive = person === id;
+			view = v;
+			const now = v.people.find((p) => p.name !== null && p.name.toLowerCase() === name.toLowerCase());
+			if (wasActive) person = now?.id ?? null;
+		} catch (e) {
+			error = String(e);
+		}
+	}
+
+	/** Cycle the person filter: everyone → each person in turn → everyone. */
+	function cyclePerson() {
+		const ids = view?.people.map((p) => p.id) ?? [];
+		person = ids[(person === null ? -1 : ids.indexOf(person)) + 1] ?? null;
+	}
+
+	/** Take the current frame out of the filtered person (a wrong match). */
+	async function notThisPerson() {
+		if (!view || !shot || person === null) return;
+		const faces = shot.faces.flatMap((f, i) => (f.person === person ? [i] : []));
+		try {
+			for (const i of faces) view = await api.assignFace(shot.file, i, 0);
+		} catch (e) {
+			error = String(e);
+		}
+	}
+
 	async function setFullscreen(on: boolean) {
 		fullscreen = on;
 		if (on && mode === 'grid') mode = 'full';
@@ -385,6 +431,9 @@
 		else if (k === 'ArrowUp') stepGroup(-1);
 		else if (k === 'Tab' && compare) setActive(1 - active);
 		else if (k === 'u' || k === 'U') decide([[cur, null]]);
+		else if (e.code === 'KeyP' && e.shiftKey) notThisPerson();
+		else if (e.code === 'KeyP') cyclePerson();
+		else if (e.code === 'KeyN' && person !== null) peopleBar?.rename(person);
 		else if (k === 'Enter') acceptGroup();
 		else if (e.code === 'KeyF' && e.shiftKey) setFullscreen(!fullscreen);
 		else if (e.code === 'KeyF') fullscreen ? setFullscreen(false) : (mode = mode === 'full' ? 'grid' : 'full');
@@ -434,7 +483,13 @@
 	};
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window
+	{onkeydown}
+	onkeyup={(e) => {
+		// Space would also click a focused button on release.
+		if (stage === 'reframe' && reframer?.handleKeyUp(e)) e.preventDefault();
+	}}
+/>
 
 <div class="app">
 	{#if !fullscreen}
@@ -478,6 +533,9 @@
 				</button>
 			{/if}
 		</header>
+		{#if view && stage === 'cull' && view.people.length > 0}
+			<People bind:this={peopleBar} people={view.people} bind:active={person} onname={namePerson} />
+		{/if}
 	{/if}
 
 	{#if error}
@@ -564,6 +622,7 @@
 							data={reframeData && 'faces' in reframeData ? reframeData : undefined}
 							error={reframeData && 'error' in reframeData ? reframeData.error : null}
 							minLong={view.minLong}
+							bind:cropOnly
 							onkeep={(list) => keepCrops(cur, list)}
 							onnext={() => stepPick(1)}
 							onprev={() => stepPick(-1)}
@@ -687,9 +746,10 @@
 			<footer>
 				{#if shot}<span class="now"><Badge {shot} /> {shot.file}</span>{/if}
 				<span class="keys">
-					<kbd>←→</kbd> pick <kbd>↑↓</kbd> suggestion <kbd>Enter</kbd> keep <kbd>⇧Enter</kbd> keep+next
+					<kbd>↑↓</kbd> pick <kbd>←→</kbd> crop <kbd>Enter</kbd> keep <kbd>⇧Enter</kbd> keep+next
 					<kbd>A</kbd> ratio <kbd>O</kbd> orient <kbd>−</kbd>/<kbd>=</kbd> size <kbd>Ctrl+arrows</kbd> nudge
-					<kbd>Z</kbd> result <kbd>Del</kbd> remove <kbd>2</kbd> pick <kbd>X</kbd>/<kbd>Esc</kbd> cull
+					<kbd>Z</kbd> crop only {cropOnly ? 'on' : 'off'} <kbd>hold Space</kbd> original <kbd>Del</kbd> remove <kbd>2</kbd> pick
+					<kbd>X</kbd>/<kbd>Esc</kbd> cull
 				</span>
 			</footer>
 		{:else if !fullscreen}
@@ -700,6 +760,7 @@
 					<kbd>⇧2</kbd>/<kbd>⇧R</kbd> group <kbd>U</kbd> clear <kbd>Enter</kbd> accept group
 					<kbd>F</kbd> full <kbd>⇧F</kbd> fullscreen <kbd>M</kbd> mark <kbd>C</kbd> compare <kbd>E</kbd> eyes {eyesMode ? 'on' : 'off'}
 					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join <kbd>X</kbd> reframe
+					{#if view.people.length}<kbd>P</kbd> person{#if person !== null} <kbd>N</kbd> name <kbd>⇧P</kbd> not them{/if}{/if}
 				</span>
 			</footer>
 		{/if}
@@ -737,6 +798,9 @@
 		border-radius: 6px;
 		padding: 0.3rem 0.7rem;
 		cursor: pointer;
+		/* A press on the label must not start a text selection. */
+		user-select: none;
+		-webkit-user-select: none;
 	}
 	:global(button:disabled) {
 		opacity: 0.45;

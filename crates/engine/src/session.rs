@@ -32,6 +32,9 @@ pub struct Session {
     /// Crops kept in Reframe, per file.
     #[serde(default)]
     pub crops: BTreeMap<String, Vec<KeptCrop>>,
+    /// Per-face fixes to the people grouping: "file:face" → person id (0 = nobody).
+    #[serde(default)]
+    pub people: BTreeMap<String, u32>,
 }
 
 impl Session {
@@ -89,6 +92,7 @@ mod tests {
     fn loads_sessions_from_before_crops() {
         let s: Session = serde_json::from_str(r#"{"decisions":{"a":{"mark":"pick"}},"splits":[],"joins":[],"sent":{}}"#).unwrap();
         assert!(s.crops.is_empty());
+        assert!(s.people.is_empty());
         assert_eq!(s.decisions.len(), 1);
     }
 }

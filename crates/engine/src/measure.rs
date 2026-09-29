@@ -45,6 +45,14 @@ pub struct FaceMetrics {
     pub eye_boxes: [[f32; 4]; 2],
     /// Box spanning both eyes, full-res pixels, for the UI's eye strip.
     pub eyes_box: [f32; 4],
+    /// SFace identity embedding, unit length; empty when the face was too
+    /// small to identify (or the shot predates embeddings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embed: Vec<f32>,
+    /// Length of the embedding before normalising: how face-like and sharp
+    /// the face looked to the identity model.
+    #[serde(default)]
+    pub embed_norm: f32,
 }
 
 fn dist(a: &[f32; 3], b: &[f32; 3]) -> f32 {
@@ -101,6 +109,8 @@ pub fn measure(img: &RgbImage, det: &Detection, mesh: &Mesh) -> FaceMetrics {
             let pad = 0.15 * (x1 - x0);
             [x0 - pad, y0 - pad, x1 - x0 + 2.0 * pad, y1 - y0 + 2.0 * pad]
         },
+        embed: vec![],
+        embed_norm: 0.0,
     };
     m
 }

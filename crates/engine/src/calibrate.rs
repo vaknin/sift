@@ -203,6 +203,8 @@ mod tests {
             cut: false,
             eye_boxes: [[0.0; 4]; 2],
             eyes_box: [0.0; 4],
+            embed: vec![],
+            embed_norm: 0.0,
         };
         ShotAnalysis {
             file: format!("{t}.CR3"),
@@ -215,6 +217,7 @@ mod tests {
             frame_sharp: 0.3,
             sig: vec![100; 256],
             error: None,
+            embedded: false,
         }
     }
 

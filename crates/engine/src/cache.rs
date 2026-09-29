@@ -48,6 +48,10 @@ pub fn thumb_name(a: &ShotAnalysis) -> String {
 pub fn eyes_name(a: &ShotAnalysis, face: usize) -> String {
     format!("{}_eyes{face}.jpg", a.stem())
 }
+/// The face aligned for identity (112² px), written for faces with an embedding.
+pub fn face_name(a: &ShotAnalysis, face: usize) -> String {
+    format!("{}_face{face}.jpg", a.stem())
+}
 
 impl Cache {
     pub fn for_folder(folder: &Path) -> Result<Self> {
