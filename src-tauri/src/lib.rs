@@ -232,6 +232,28 @@ fn initial_folder() -> Option<PathBuf> {
     std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_dir())
 }
 
+/// `~/.local/state/sift/last-folder`: the folder opened last, for Continue.
+fn last_folder_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("sift").join("last-folder"))
+}
+
+fn remember_folder(folder: &std::path::Path) -> std::io::Result<()> {
+    let p = last_folder_path().ok_or_else(|| std::io::Error::other("no state directory"))?;
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(p, folder.as_os_str().as_encoded_bytes())
+}
+
+/// The folder opened last, if it still exists.
+#[tauri::command]
+fn last_folder() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let p = PathBuf::from(std::ffi::OsString::from_vec(std::fs::read(last_folder_path()?).ok()?));
+    p.is_dir().then_some(p)
+}
+
 /// Ask for a shoot folder. A GTK chooser made transient for the main window,
 /// so the compositor floats it over sift: the dialog plugin sets no parent
 /// on Linux, and Hyprland then tiles its chooser wherever focus happens to be.
@@ -277,6 +299,9 @@ async fn open_folder(app: AppHandle, path: PathBuf) -> Result<View, String> {
             let _ = app.emit("progress", Progress { done, total, thumb });
         };
         let (cache, shots) = analyze_folder(&path, models, &on_shot).map_err(|e| format!("{e:#}"))?;
+        if let Err(e) = remember_folder(&cache.folder) {
+            eprintln!("sift: could not remember {}: {e}", cache.folder.display());
+        }
         let auto = cull::group(&shots, &Config::default());
         let session = Session::load(&cache);
         let mut open = Open { cache, shots, auto, session, library: Library::load(), people: vec![] };
@@ -441,6 +466,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             initial_folder,
+            last_folder,
             pick_folder,
             open_folder,
             set_decisions,

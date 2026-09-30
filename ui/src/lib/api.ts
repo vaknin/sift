@@ -2,6 +2,8 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import type { Crop, DarktableStatus, Decision, KeptCrop, Mark, Note, Ratio, ReframeView, Report, Shot, View } from './types';
 
 export const initialFolder = () => invoke<string | null>('initial_folder');
+/** The folder opened last, for Continue; null when none or it is gone. */
+export const lastFolder = () => invoke<string | null>('last_folder');
 /** Folder chooser floating over the window; null when cancelled. */
 export const pickFolder = (start: string | null) => invoke<string | null>('pick_folder', { start });
 export const openFolder = (path: string) => invoke<View>('open_folder', { path });
@@ -29,7 +31,7 @@ export const matches = (s: Shot, f: 'all' | 'pending' | 'picked' | 'rejected'): 
 	f === 'all' ||
 	(f === 'pending' && s.decision === null) ||
 	(f === 'picked' && effective(s) === 'pick') ||
-	(f === 'rejected' && effective(s) === 'reject');
+	(f === 'rejected' && s.decision?.mark === 'reject');
 
 const REASON_TEXT: Record<string, string> = {
 	'eyes-closed': 'eyes closed',

@@ -21,6 +21,10 @@
 	let error = $state<string | null>(null);
 	let cur = $state(0);
 	let filter = $state<Filter>('all');
+	/** Drop frames you rejected from every filter but `rejected`, so a reject vanishes. */
+	let hideRejected = $state(readHide());
+	/** The folder opened last, for Continue. */
+	let last = $state<string | null>(null);
 	/** Show only frames with this person in them (`View.people` id). */
 	let person = $state<number | null>(null);
 	let peopleBar = $state<{ rename: (id: number) => void; label: (p: import('$lib/types').Person) => string }>();
@@ -68,6 +72,7 @@
 			(i) =>
 				view !== null &&
 				matches(view.shots[i]!, filter) &&
+				!(hideRejected && filter !== 'rejected' && view.shots[i]!.decision?.mark === 'reject') &&
 				(person === null || view.shots[i]!.faces.some((f) => f.person === person))
 		);
 	const visibleGroups = $derived(view ? view.groups.map((_, gi) => gi).filter((gi) => tilesOf(gi).length > 0) : []);
@@ -83,7 +88,7 @@
 		for (const s of view?.shots ?? []) {
 			const m = effective(s);
 			if (m === 'pick') c.pick++;
-			if (m === 'reject') c.reject++;
+			if (s.decision?.mark === 'reject') c.reject++;
 			if (s.decision === null) c.pending++;
 		}
 		return c;
@@ -154,6 +159,23 @@
 		} finally {
 			unlisten();
 			progress = null;
+			last = await api.lastFolder().catch(() => last);
+		}
+	}
+
+	function readHide(): boolean {
+		try {
+			return localStorage.getItem('hideRejected') === '1';
+		} catch {
+			return false;
+		}
+	}
+	function setHide(on: boolean) {
+		hideRejected = on;
+		try {
+			localStorage.setItem('hideRejected', on ? '1' : '0');
+		} catch {
+			// not remembered; the toggle still works
 		}
 	}
 
@@ -406,6 +428,11 @@
 			pickFolder();
 			return;
 		}
+		if (e.ctrlKey && e.code === 'KeyC' && !view && !progress && last) {
+			e.preventDefault();
+			load(last);
+			return;
+		}
 		if (view && shot && stage === 'reframe') {
 			const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
 			const toCull = plain && ((e.code === 'Digit2' && !e.shiftKey) || (e.code === 'KeyR' && !e.shiftKey) || (e.code === 'KeyF' && e.shiftKey));
@@ -441,6 +468,7 @@
 		else if (k === 'c' || k === 'C') compare ? (mode = back) : openCompare();
 		else if (k === 'e' || k === 'E') eyesMode = !eyesMode;
 		else if (k === 'b' || k === 'B') boost = !boost;
+		else if (e.code === 'KeyH' && stage === 'cull') setHide(!hideRejected);
 		else if (k === 's' || k === 'S') regroup(true);
 		else if (k === 'j' || k === 'J') regroup(false);
 		else if (e.code === 'KeyX') toggleStage();
@@ -454,7 +482,8 @@
 	}
 
 	onMount(async () => {
-		const dir = await api.initialFolder();
+		const [dir, l] = await Promise.all([api.initialFolder(), api.lastFolder().catch(() => null)]);
+		last = l;
 		if (dir) await load(dir);
 	});
 
@@ -471,7 +500,7 @@
 			const s = view!.shots[i]!;
 			const m = effective(s);
 			if (m === 'pick') c.pick++;
-			if (m === 'reject') c.reject++;
+			if (s.decision?.mark === 'reject') c.reject++;
 			if (s.decision === null) c.pending++;
 		}
 		return c;
@@ -516,6 +545,15 @@
 							<button class:on={filter === f} onclick={() => (filter = f)}>{f}</button>
 						{/each}
 					</div>
+					<button
+						class="hide"
+						class:on={hideRejected && filter !== 'rejected'}
+						disabled={filter === 'rejected'}
+						onclick={() => setHide(!hideRejected)}
+						title="H: hide rejected frames"
+					>
+						hide ✗
+					</button>
 					<span class="counts">
 						<span class="pick">★ {counts.pick}</span>
 						<span class="reject">✗ {counts.reject}</span>
@@ -588,8 +626,14 @@
 	{:else if !view}
 		<div class="welcome">
 			<p>Open a shoot folder to cull it.</p>
-			<button class="open" onclick={pickFolder}>Open folder…</button>
-			<p class="muted">or press <kbd>Ctrl+O</kbd></p>
+			{#if last}
+				<button class="open" onclick={() => load(last!)} title={last}>Continue · {last.split('/').at(-1)}</button>
+				<button onclick={pickFolder}>Open folder…</button>
+				<p class="muted"><kbd>Ctrl+C</kbd> continue · <kbd>Ctrl+O</kbd> open</p>
+			{:else}
+				<button class="open" onclick={pickFolder}>Open folder…</button>
+				<p class="muted">or press <kbd>Ctrl+O</kbd></p>
+			{/if}
 		</div>
 	{:else}
 		<div class="body">
@@ -705,7 +749,10 @@
 					</div>
 					{#if !fullscreen}
 						<Filmstrip
-							shots={groupFrames.map((i) => ({ shot: view!.shots[i]!, index: i }))}
+							shots={(hideRejected && filter !== 'rejected'
+								? groupFrames.filter((i) => view!.shots[i]!.decision?.mark !== 'reject')
+								: groupFrames
+							).map((i) => ({ shot: view!.shots[i]!, index: i }))}
 							current={cur}
 							{sel}
 							onselect={pickFrame}
@@ -759,7 +806,7 @@
 					<kbd>←→</kbd> frame <kbd>↑↓</kbd> group <kbd>2</kbd> pick <kbd>R</kbd> reject
 					<kbd>⇧2</kbd>/<kbd>⇧R</kbd> group <kbd>U</kbd> clear <kbd>Enter</kbd> accept group
 					<kbd>F</kbd> full <kbd>⇧F</kbd> fullscreen <kbd>M</kbd> mark <kbd>C</kbd> compare <kbd>E</kbd> eyes {eyesMode ? 'on' : 'off'}
-					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join <kbd>X</kbd> reframe
+					<kbd>B</kbd> boost {boost ? 'on' : 'off'} <kbd>H</kbd> hide ✗ {hideRejected ? 'on' : 'off'} <kbd>S</kbd> split <kbd>J</kbd> join <kbd>X</kbd> reframe
 					{#if view.people.length}<kbd>P</kbd> person{#if person !== null} <kbd>N</kbd> name <kbd>⇧P</kbd> not them{/if}{/if}
 				</span>
 			</footer>
@@ -856,9 +903,13 @@
 	.filters button:last-child {
 		border-radius: 0 6px 6px 0;
 	}
-	.filters button.on {
+	.filters button.on,
+	.hide.on {
 		background: var(--accent);
 		color: #111;
+	}
+	.hide:disabled {
+		opacity: 0.4;
 	}
 	.counts {
 		display: flex;
