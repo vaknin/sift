@@ -30,7 +30,7 @@ export const effective = (s: Shot): Mark => s.decision?.mark ?? s.verdict.mark;
 export const matches = (s: Shot, f: 'all' | 'pending' | 'picked' | 'rejected'): boolean =>
 	f === 'all' ||
 	(f === 'pending' && s.decision === null) ||
-	(f === 'picked' && effective(s) === 'pick') ||
+	(f === 'picked' && s.decision?.mark === 'pick') ||
 	(f === 'rejected' && s.decision?.mark === 'reject');
 
 const REASON_TEXT: Record<string, string> = {
